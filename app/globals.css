@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+/* Brand greens sampled from the EM logo. Status colours stay amber/red:
+   green is both the brand and "healthy", so every state also has a word. */
+@theme {
+  --color-brand-dark: #1f5c34;
+  --color-brand: #2e7d46;
+  --color-brand-mid: #4a9e52;
+  --color-brand-light: #7fbf57;
+  --color-brand-wash: #f1f8ee;
+  --color-ink: #14251a;
+  --color-ink-2: #4a5b50;
+  --color-ink-3: #7a8a80;
+  --color-line: #e2eae4;
+  --color-surface-2: #f7faf8;
+  --color-warn: #b26a00;
+  --color-warn-bg: #fff4e0;
+  --color-crit: #c62828;
+  --color-crit-bg: #fdecec;
+}
+
+body {
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+}
