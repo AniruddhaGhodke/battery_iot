@@ -2,30 +2,29 @@
 
 import Image from "next/image";
 import { useCallback, useEffect, useState } from "react";
-import type { Reading } from "@/lib/telemetry";
-import type { StoreStats } from "@/lib/store";
+import type { History, PackDetail, PackSummary, Point } from "@/lib/data";
+import type { Status } from "@/lib/ingest-status";
 import { ago, fmt, skew } from "@/lib/format";
 import { StatCard } from "./StatCard";
 import { Sparkline } from "./Sparkline";
 import { CellBars } from "./CellBars";
 
 const POLL_MS = 3000;
+const HISTORY_REFRESH_MS = 60_000;
+const H = 3_600_000;
+const D = 24 * H;
 
-type PackSummary = {
-  packId: string;
-  online: boolean;
-  lastSeen: number;
-  messages: number;
-  seriesCount: number;
-  voltage: number | null;
-  current: number | null;
-  soc: number | null;
-  spreadMv: number | null;
-  activeAlarms: string[];
-};
-type PackDetail = { packId: string; online: boolean; messages: number; firstSeen: number; latest: Reading };
-type Point = { t: number; voltage: number | null; current: number | null; power: number | null; soc: number | null; spreadMv: number | null; maxTemp: number | null };
-type Status = StoreStats & { packs: number; uptimeS: number };
+const RANGES = [
+  { key: "live", label: "Live", ms: 0 },
+  { key: "6h", label: "6 h", ms: 6 * H },
+  { key: "24h", label: "24 h", ms: D },
+  { key: "7d", label: "7 d", ms: 7 * D },
+  { key: "30d", label: "30 d", ms: 30 * D },
+  { key: "90d", label: "90 d", ms: 90 * D },
+  { key: "1y", label: "1 y", ms: 365 * D },
+  { key: "custom", label: "Custom", ms: 0 },
+] as const;
+type RangeKey = (typeof RANGES)[number]["key"];
 
 const ALARM_LABEL: Record<string, string> = {
   over_current: "Over-current",
@@ -44,12 +43,33 @@ async function getJson<T>(url: string): Promise<T | null> {
   }
 }
 
+/** Value for <input type="datetime-local"> in the browser's time zone. */
+function toLocalInput(ms: number): string {
+  const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60_000);
+  return d.toISOString().slice(0, 16);
+}
+
+function describeSource(h: History | null): string {
+  if (!h) return "last 360 readings";
+  if (h.source === "raw") return "every reading";
+  const b = h.bucketS;
+  const size = b < 3600 ? `${b / 60} min` : b < 86_400 ? `${b / 3600} h` : `${b / 86_400} day`;
+  return `${size} averages · shaded band = min–max`;
+}
+
 export default function Dashboard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [packs, setPacks] = useState<PackSummary[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<PackDetail | null>(null);
   const [series, setSeries] = useState<Point[]>([]);
+  const [history, setHistory] = useState<History | null>(null);
+  const [range, setRange] = useState<RangeKey>("live");
+  const [custom, setCustom] = useState<[number, number]>(() => [Date.now() - D, Date.now()]);
+  const [customDraft, setCustomDraft] = useState<[string, string]>(() => [
+    toLocalInput(Date.now() - D),
+    toLocalInput(Date.now()),
+  ]);
   const [now, setNow] = useState(() => Date.now());
   const [apiDown, setApiDown] = useState(false);
 
@@ -67,13 +87,29 @@ export default function Dashboard() {
     if (id) {
       const [d, s] = await Promise.all([
         getJson<PackDetail>(`/api/packs/${encodeURIComponent(id)}`),
-        getJson<Point[]>(`/api/packs/${encodeURIComponent(id)}/recent?limit=360`),
+        range === "live"
+          ? getJson<Point[]>(`/api/packs/${encodeURIComponent(id)}/recent?limit=360`)
+          : Promise.resolve(undefined),
       ]);
       setDetail(d);
-      setSeries(s ?? []);
+      if (s !== undefined) setSeries(s ?? []);
     }
     setNow(Date.now());
-  }, [selected]);
+  }, [selected, range]);
+
+  // ?range=7d in the URL, so a view can be bookmarked or shared.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("range");
+    if (RANGES.some((x) => x.key === q && x.key !== "custom")) setRange(q as RangeKey);
+  }, []);
+
+  const chooseRange = (key: RangeKey) => {
+    setRange(key);
+    const url = new URL(window.location.href);
+    if (key === "live" || key === "custom") url.searchParams.delete("range");
+    else url.searchParams.set("range", key);
+    window.history.replaceState(null, "", url);
+  };
 
   useEffect(() => {
     poll();
@@ -81,7 +117,36 @@ export default function Dashboard() {
     return () => clearInterval(t);
   }, [poll]);
 
+  // History mode: load the selected range, refresh once a minute.
+  useEffect(() => {
+    if (range === "live" || !selected) {
+      setHistory(null);
+      return;
+    }
+    let cancelled = false;
+    const span = RANGES.find((r) => r.key === range)!.ms;
+    const load = async () => {
+      const [from, to] = range === "custom" ? custom : [Date.now() - span, Date.now()];
+      const h = await getJson<History>(
+        `/api/packs/${encodeURIComponent(selected)}/history?from=${Math.round(from)}&to=${Math.round(to)}`,
+      );
+      if (!cancelled && h) {
+        setHistory(h);
+        setSeries(h.points);
+      }
+    };
+    setSeries([]);
+    void load();
+    const t = range === "custom" ? null : setInterval(load, HISTORY_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      if (t) clearInterval(t);
+    };
+  }, [range, selected, custom]);
+
   const r = detail?.latest;
+  const domain: [number, number] | undefined = history ? [history.from, history.to] : undefined;
+  const gapMs = Math.max((history?.bucketS ?? 0) * 2500, (status?.staleAfterS ?? 60) * 1000);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6">
@@ -112,11 +177,11 @@ export default function Dashboard() {
             >
               <div className="flex items-center gap-2 font-medium">
                 <span className={`h-2 w-2 rounded-full ${p.online ? "bg-brand-mid" : "bg-ink-3"}`} />
-                {p.packId}
+                {p.label || p.packId}
               </div>
               <div className="text-xs text-ink-3">
                 {p.seriesCount ? `${p.seriesCount}S · ` : ""}
-                {fmt(p.voltage, 1, "V")} · {p.online ? ago(p.lastSeen, now) : "offline"}
+                {fmt(p.voltage, 1, "V")} · {p.online ? ago(p.lastSeen, now) : `offline, ${ago(p.lastSeen, now)}`}
                 {p.activeAlarms.length > 0 && <span className="ml-1 font-semibold text-crit">· {p.activeAlarms.length} alarm</span>}
               </div>
             </button>
@@ -131,7 +196,7 @@ export default function Dashboard() {
           {/* Banners */}
           {!detail!.online && (
             <Banner tone="warn">
-              No data from <b>{r.packId}</b> for {ago(r.receivedAt, now).replace(" ago", "")}. Showing the last reading received.
+              No data from <b>{r.packId}</b> for {ago(detail!.lastSeen, now).replace(" ago", "")}. Showing the last reading received.
             </Banner>
           )}
           {r.activeAlarms.length > 0 && (
@@ -186,11 +251,83 @@ export default function Dashboard() {
           </section>
 
           {/* Trends */}
-          <section className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-            <Sparkline label="Pack voltage" unit="V" points={series.map((p) => ({ t: p.t, v: p.voltage }))} />
-            <Sparkline label="Current" unit="A" points={series.map((p) => ({ t: p.t, v: p.current }))} />
-            <Sparkline label="State of charge" unit="%" points={series.map((p) => ({ t: p.t, v: p.soc }))} />
-            <Sparkline label="Cell spread" unit="mV" dp={0} points={series.map((p) => ({ t: p.t, v: p.spreadMv }))} />
+          <section className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap gap-1">
+                {RANGES.map((x) => (
+                  <button
+                    key={x.key}
+                    onClick={() => chooseRange(x.key)}
+                    className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                      range === x.key
+                        ? "border-brand bg-brand-wash text-brand-dark"
+                        : "border-line bg-white text-ink-2 hover:border-brand-light"
+                    }`}
+                  >
+                    {x.label}
+                  </button>
+                ))}
+              </div>
+              <span className="text-xs text-ink-3">{describeSource(history)}</span>
+            </div>
+            {range === "custom" && (
+              <form
+                className="flex flex-wrap items-center gap-2 text-xs text-ink-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const from = new Date(customDraft[0]).getTime();
+                  const to = new Date(customDraft[1]).getTime();
+                  if (Number.isFinite(from) && Number.isFinite(to) && from < to) setCustom([from, to]);
+                }}
+              >
+                <label>
+                  From{" "}
+                  <input
+                    type="datetime-local"
+                    value={customDraft[0]}
+                    onChange={(e) => setCustomDraft([e.target.value, customDraft[1]])}
+                    className="rounded-md border border-line bg-white px-2 py-1"
+                  />
+                </label>
+                <label>
+                  to{" "}
+                  <input
+                    type="datetime-local"
+                    value={customDraft[1]}
+                    onChange={(e) => setCustomDraft([customDraft[0], e.target.value])}
+                    className="rounded-md border border-line bg-white px-2 py-1"
+                  />
+                </label>
+                <button type="submit" className="rounded-md border border-brand bg-brand-wash px-3 py-1 font-medium text-brand-dark">
+                  Show
+                </button>
+              </form>
+            )}
+            <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+              <Sparkline
+                label="Pack voltage"
+                unit="V"
+                domain={domain}
+                gapMs={gapMs}
+                points={series.map((p) => ({ t: p.t, v: p.voltage, lo: p.voltageMin, hi: p.voltageMax }))}
+              />
+              <Sparkline
+                label="Current"
+                unit="A"
+                domain={domain}
+                gapMs={gapMs}
+                points={series.map((p) => ({ t: p.t, v: p.current, lo: p.currentMin, hi: p.currentMax }))}
+              />
+              <Sparkline label="State of charge" unit="%" domain={domain} gapMs={gapMs} points={series.map((p) => ({ t: p.t, v: p.soc }))} />
+              <Sparkline
+                label="Cell spread"
+                unit="mV"
+                dp={0}
+                domain={domain}
+                gapMs={gapMs}
+                points={series.map((p) => ({ t: p.t, v: p.spreadMv, hi: p.spreadMax }))}
+              />
+            </div>
           </section>
 
           {/* Device info */}
@@ -210,10 +347,11 @@ export default function Dashboard() {
               <h2 className="mb-3 font-semibold">Device</h2>
               <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
                 <dt className="text-ink-3">Device ID</dt><dd className="font-mono">{r.packId}</dd>
+                {detail!.site && (<><dt className="text-ink-3">Site</dt><dd>{detail!.site}</dd></>)}
                 <dt className="text-ink-3">Status</dt><dd>{r.status}</dd>
                 <dt className="text-ink-3">Topic</dt><dd className="break-all font-mono text-xs">{r.topic}</dd>
-                <dt className="text-ink-3">Last message</dt><dd>{new Date(r.receivedAt).toLocaleTimeString()} ({ago(r.receivedAt, now)})</dd>
-                <dt className="text-ink-3">Messages</dt><dd>{detail!.messages} since {new Date(detail!.firstSeen).toLocaleTimeString()}</dd>
+                <dt className="text-ink-3">Last message</dt><dd>{new Date(detail!.lastSeen).toLocaleString()} ({ago(detail!.lastSeen, now)})</dd>
+                <dt className="text-ink-3">Messages</dt><dd>{detail!.messages.toLocaleString()} since {new Date(detail!.firstSeen).toLocaleString()}</dd>
                 <dt className="text-ink-3">Device clock</dt>
                 <dd className={r.clockSkewS !== null && Math.abs(r.clockSkewS) > 300 ? "font-semibold text-warn" : ""}>
                   {skew(r.clockSkewS)}
@@ -226,11 +364,20 @@ export default function Dashboard() {
         </main>
       )}
 
-      <footer className="mt-8 border-t border-line pt-3 text-xs text-ink-3">
-        Exergi Murphy Power Solutions · data held in memory only — restarting the server clears it
+      <footer className="mt-8 flex flex-wrap justify-between gap-2 border-t border-line pt-3 text-xs text-ink-3">
+        <span>Exergi Murphy Power Solutions</span>
+        {status?.db.ok && status.db.readingsBytes !== null && (
+          <span>history stored in database · {formatBytes(status.db.readingsBytes)} of readings</span>
+        )}
       </footer>
     </div>
   );
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
 
 function Banner({ tone, children }: { tone: "warn" | "crit"; children: React.ReactNode }) {
@@ -241,12 +388,16 @@ function Banner({ tone, children }: { tone: "warn" | "crit"; children: React.Rea
 function ConnectionBadge({ status, apiDown }: { status: Status | null; apiDown: boolean }) {
   if (apiDown) return <Pill tone="crit" text="Server not responding" />;
   if (!status) return <Pill tone="muted" text="Connecting…" />;
+  if (!status.db.ok) return <Pill tone="crit" text="Database unreachable" />;
+  if (!status.ingest) return <Pill tone="crit" text="Ingest not running" />;
+  const ing = status.ingest;
   return (
     <div className="flex items-center gap-3 text-xs text-ink-3">
       <span className="hidden sm:inline">
-        {status.broker.replace(/^mqtts?:\/\//, "")} · {status.received} msgs
+        {ing.mqtt.broker.replace(/^mqtts?:\/\//, "")} · {ing.messages.received} msgs
+        {ing.writer.buffered > 100 && <b className="text-warn"> · {ing.writer.buffered} waiting to be saved</b>}
       </span>
-      {status.connected ? <Pill tone="ok" text="Broker connected" /> : <Pill tone="crit" text="Broker disconnected" />}
+      {ing.mqtt.connected ? <Pill tone="ok" text="Broker connected" /> : <Pill tone="crit" text="Broker disconnected" />}
     </div>
   );
 }
@@ -261,38 +412,45 @@ function Pill({ tone, text }: { tone: "ok" | "crit" | "muted"; text: string }) {
   return <span className={`rounded-full border px-3 py-1 text-xs font-medium ${cls}`}>{text}</span>;
 }
 
-/** When nothing is showing, say exactly why - the lesson of the last two days. */
+/** When nothing is showing, say exactly why. */
 function EmptyState({ status, apiDown }: { status: Status | null; apiDown: boolean }) {
   let title = "Waiting for data";
   let hint = "Connected to the broker. Nothing has arrived on the topic yet — is the device powered and publishing?";
+  const ing = status?.ingest;
   if (apiDown) {
     title = "The dashboard server is not responding";
-    hint = "Is `npm run dev` still running in the terminal?";
-  } else if (status && !status.connected) {
+    hint = "Is `npm run dev` (or `docker compose up`) still running?";
+  } else if (status && !status.db.ok) {
+    title = "Cannot reach the database";
+    hint = `Start it with \`docker compose up -d db\`. Error: ${status.db.error ?? "unknown"}`;
+  } else if (status && !ing) {
+    title = "The ingest service is not running";
+    hint = `Nothing is receiving MQTT messages. Start it with \`npm run ingest:dev\` (or \`docker compose up -d\`). ${status.ingestError ?? ""}`;
+  } else if (ing && !ing.mqtt.connected) {
     title = "Not connected to the MQTT broker";
-    hint = status.lastError?.includes("ENOTFOUND")
-      ? "Your Mac cannot resolve the broker hostname. This is the DNS problem from before — set DNS to 1.1.1.1 for this network."
-      : `Last error: ${status.lastError ?? "none yet — still connecting"}`;
-  } else if (status && status.received > 0 && status.accepted === 0) {
+    hint = ing.mqtt.lastError?.includes("ENOTFOUND")
+      ? "This machine cannot resolve the broker hostname. Usually DNS: set DNS to 1.1.1.1 for this network, then restart ingest."
+      : `Last error: ${ing.mqtt.lastError ?? "none yet — still connecting"}`;
+  } else if (ing && ing.messages.received > 0 && ing.messages.accepted === 0) {
     title = "Messages are arriving but all were rejected";
-    const r = status.rejected;
+    const r = ing.messages.rejected;
     hint =
       r.notAllowed > 0
-        ? `The device_id is not in ALLOWED_DEVICES (${status.allowlist.join(", ") || "empty"}). Add it to .env.local and restart.`
+        ? `Device ${ing.packs.unknown.map((u) => u.deviceId).join(", ") || "?"} is not an enabled pack. Add it to ALLOWED_DEVICES in .env.local and restart ingest.`
         : r.notJson > 0
           ? "Payloads are not valid JSON."
           : r.noDeviceId > 0
             ? "Payloads have no valid device_id field."
-            : `Payload problem: ${status.lastError ?? "unknown"}`;
+            : `Payload problem: ${ing.messages.lastRejection ?? "unknown"}`;
   }
   return (
     <div className="mt-10 rounded-xl border border-line bg-white p-8 text-center shadow-sm">
       <h2 className="text-lg font-semibold text-ink">{title}</h2>
       <p className="mx-auto mt-2 max-w-xl text-sm text-ink-2">{hint}</p>
-      {status && (
+      {ing && (
         <p className="mt-4 font-mono text-xs text-ink-3">
-          topic {status.topic} · received {status.received} · accepted {status.accepted} ·
-          rejected {Object.values(status.rejected).reduce((a, b) => a + b, 0)}
+          topic {ing.mqtt.topic} · received {ing.messages.received} · accepted {ing.messages.accepted} ·
+          rejected {Object.values(ing.messages.rejected).reduce((a, b) => a + b, 0)}
         </p>
       )}
     </div>

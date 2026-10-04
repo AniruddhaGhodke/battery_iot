@@ -1,0 +1,15 @@
+# HTTPS for the dashboard. SITE_ADDRESS is a hostname pointing at the droplet;
+# Caddy gets its Let's Encrypt certificate on first start.
+#
+# Basic auth until the app has its own logins (TODO 3). New password hash:
+#   docker compose exec caddy caddy hash-password --plaintext '<password>'
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+
+	reverse_proxy web:3100
+}

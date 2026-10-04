@@ -1,7 +1,9 @@
 # TODO
 
-Step 1 — live dashboard from MQTT — is done. Everything below is what remains,
-roughly in the order it pays off.
+Step 1 (live dashboard from MQTT) and step 2 (persistent history, Docker)
+are done. The order we're working in, and why, is in [PLAN.md](PLAN.md).
+Alerts (3), notifications (6) and remote commands (8) are deferred: noted,
+not scheduled.
 
 The earlier Python implementation in `../bms_iot` already solves most of
 these and has tests. Treat it as the reference when porting; file pointers are
@@ -9,25 +11,25 @@ given where useful.
 
 ---
 
-## 2. Persistent history
+## 2. Persistent history — done
 
-Right now readings live in memory and vanish on restart. Nothing else on this
-list (alerts, trends, reports) works without stored history.
+- [x] Storage: Postgres 17 + TimescaleDB 2.30 in Docker (`db/migrations/001_init.sql`)
+- [x] Every accepted reading written by the new `ingest/` worker, batched once
+      per second (MQTT moved out of Next.js; `lib/store.ts` is gone)
+- [x] Table `readings`: one row per reading, `(pack_id, ts)` key, pack totals,
+      cells as smallint mV, temperatures as 0.1 °C, alarms as a bitmask
+- [x] Keyed on **arrival time**; device time only once firmware sends
+      `time_ok` (and for `replay`). Both are stored
+- [x] `/api/packs/[id]/history?from=&to=` and range buttons (Live, 6 h … 1 y, Custom)
+- [x] Retention: raw 90 days, compressed after 2 days (measured 8.8×);
+      hourly and daily roll-ups kept forever
+- [x] Latest-per-pack in `pack_latest`, so a restart doesn't blank the dashboard
+- [x] `packs` table replaces the `ALLOWED_DEVICES` check (env still seeds it)
+- [x] No data loss across ingest restarts (persistent MQTT session) or
+      database outages (in-memory buffer); both tested
+- [x] Unit tests: `npm test`
 
-- [ ] Pick storage. Options, simplest first:
-  - SQLite (`better-sqlite3`) — one file, no server, fine for a handful of packs
-  - Postgres + TimescaleDB — the existing Docker container on port 5433 works
-    as-is; better for a fleet and long retention
-- [ ] Write every accepted reading from `lib/store.ts` (same place it goes into memory)
-- [ ] Table: one row per reading, `(pack_id, received_at)` key, pack totals,
-      cell and temperature arrays. Reference: `bms_iot/server/schema.sql`
-- [ ] Key on **arrival time**, not the device clock (see Firmware, NTP)
-- [ ] `/api/packs/[id]/history?from=&to=` and a time-range picker on the dashboard
-- [ ] Retention: raw 30–90 days, hourly/daily roll-ups kept for years
-- [ ] Load latest-per-pack from the database at startup, so a restart
-      doesn't blank the dashboard
-
-## 3. Alerts
+## 3. Alerts — deferred
 
 Reference: `bms_iot/server/alerts.py`, thresholds in `bms_iot/config/alerts.yaml`.
 
@@ -66,15 +68,16 @@ Reference: `bms_iot/server/auth.py`.
 ## 5. More pages
 
 - [ ] Fleet overview: all packs, status, SOC, spread, open alerts, last seen
-- [ ] Pack detail with selectable time range and larger charts
+- [ ] Pack detail with larger charts (time range selection is done)
 - [ ] Cell deviation heat-map over time (cells × time)
 - [ ] Live raw feed — incoming MQTT messages, like MQTTX, inside the app
 - [ ] Devices: labels, site, nominal cell count, module layout (e.g. 4×12S + 1×9S),
-      allowlist managed in the UI instead of `.env.local`
+      allowlist managed in the UI instead of `.env.local`. The `packs` table
+      already has these columns; only the page is missing
 - [ ] Export: CSV per pack and time range (one column per cell)
 - [ ] Topology: detected vs configured series count, flag a mismatch
 
-## 6. Notifications
+## 6. Notifications — deferred
 
 Reference: `bms_iot/server/notify.py`.
 
@@ -95,7 +98,7 @@ readings to your topic. The allowlist limits the damage; it is not security.
 - [ ] ACL: each device may only publish to its own topic
 - [ ] Change `MQTT_URL`, `MQTT_USERNAME`, `MQTT_PASSWORD` — no code change
 
-## 8. Remote commands — only after step 7
+## 8. Remote commands — deferred; only after step 7
 
 Reference: `bms192s/protocol.py` (28 host commands), `bms192s/verification.py`.
 
@@ -134,13 +137,17 @@ Reference: `bms192s/protocol.py` (28 host commands), `bms192s/verification.py`.
 
 Reference: `bms_iot/DEPLOY_DIGITALOCEAN.md`.
 
-- [ ] Droplet, Node 20+, `npm run build && npm start` under pm2 or systemd
-      (or a Docker image). **Not Vercel** — the MQTT subscription needs a
+- [x] Docker images for web and ingest, `docker-compose.yml` with memory
+      caps matching the 1 GB droplet and log rotation
+- [ ] Droplet: swap, firewall, SSH keys; images built in GitHub Actions →
+      GHCR (`next build` won't fit in 1 GB). **Not Vercel** — ingest needs a
       long-running process
-- [ ] Caddy or nginx in front with HTTPS
-- [ ] Database on the droplet or managed, with backups
+- [ ] Caddy in front with HTTPS
+- [ ] Database on a DO Volume, with backups
 - [ ] `.env` on the server only, never in git
-- [ ] Health check on `/api/status`, alert if the broker link drops
+- [ ] Health check on `/api/status` (it already reports broker link, write
+      buffer and DB health), external uptime monitor
+- [ ] Disk-usage warning on `/api/status` at 70%
 
 ## 12. Hardware follow-ups (from the 57S discussion)
 
@@ -154,8 +161,11 @@ Reference: `bms_iot/DEPLOY_DIGITALOCEAN.md`.
 
 ## Known caveats of the current build
 
-- Memory only: restart = empty dashboard until the next message
 - Polls every 3 s; switch to Server-Sent Events if that becomes too chatty
+- Readings filed by arrival time can't be deduplicated: a QoS 1 redelivery
+  is stored twice. Fixed once firmware sends `time_ok` (or `seq`)
 - No auth: anyone who can reach port 3100 sees the data. Fine on localhost only
 - Public broker (see step 7)
 - On the iPhone hotspot, DNS must be 1.1.1.1 or the broker won't resolve
+- The reference code (`bms_iot`, `bms192s`) mentioned below isn't in this
+  checkout; items are built from this file instead

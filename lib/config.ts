@@ -1,11 +1,4 @@
-/** Server-side configuration, read once from the environment. */
-
-function list(raw: string | undefined): string[] {
-  return (raw ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
+/** Web server configuration, read once from the environment. */
 
 function int(raw: string | undefined, fallback: number): number {
   const n = Number.parseInt(raw ?? "", 10);
@@ -13,16 +6,11 @@ function int(raw: string | undefined, fallback: number): number {
 }
 
 export const config = {
-  mqttUrl: process.env.MQTT_URL || "mqtt://broker.emqx.io:1883",
-  mqttUsername: process.env.MQTT_USERNAME || undefined,
-  mqttPassword: process.env.MQTT_PASSWORD || undefined,
-  mqttTopic: process.env.MQTT_TOPIC || "emspl/a7f3c2/+/data",
-  mqttClientId:
-    process.env.MQTT_CLIENT_ID ||
-    `emspl-nextjs-${Math.random().toString(16).slice(2, 8)}`,
-  allowedDevices: list(process.env.ALLOWED_DEVICES),
-  historySize: int(process.env.HISTORY_SIZE, 720),
+  databaseUrl: process.env.DATABASE_URL || "postgres://bms:bms_local@localhost:5433/bms",
+  // ingest's internal status endpoint (MQTT link, counters).
+  ingestUrl: process.env.INGEST_URL || "http://localhost:3101",
   staleAfterS: int(process.env.STALE_AFTER_S, 60),
-  // Payloads bigger than this are someone else's traffic, not ours.
-  maxPayloadBytes: 64 * 1024,
+  // Must match the retention policy in db/migrations (raw rows older than
+  // this are gone; history falls back to the roll-ups).
+  rawRetentionDays: int(process.env.RAW_RETENTION_DAYS, 90),
 };

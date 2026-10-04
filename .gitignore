@@ -37,3 +37,6 @@ next-env.d.ts
 
 # logs
 *.log
+
+# ingest bundle
+/dist/

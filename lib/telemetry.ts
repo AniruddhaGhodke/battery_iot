@@ -18,12 +18,23 @@ export type Alarms = {
 export type Reading = {
   packId: string;
   topic: string;
-  /** Server arrival time, epoch ms. Used for everything time-related. */
+  /**
+   * Ordering time, epoch ms: deviceTime when the device says its clock is
+   * NTP-synced and it is plausible, otherwise receivedAt. See orderingTime().
+   */
+  ts: number;
+  /** Server arrival time, epoch ms. */
   receivedAt: number;
-  /** What the device claims, epoch ms. Shown, never trusted for ordering. */
+  /** What the device claims, epoch ms. Trusted only via orderingTime(). */
   deviceTime: number | null;
   /** deviceTime - receivedAt, seconds. Large = device clock is wrong. */
   clockSkewS: number | null;
+  /** Firmware says its clock is NTP-synced (`time_ok: true`). */
+  timeOk: boolean;
+  /** Sent from the device's offline buffer after a reconnect (`replay: true`). */
+  replay: boolean;
+  /** Per-boot message counter (`seq`), for spotting gaps and duplicates. */
+  seq: number | null;
   status: string;
   schema: number;
 
@@ -56,7 +67,12 @@ export type Reading = {
 
 export class PayloadError extends Error {}
 
-const ALARM_KEYS: (keyof Alarms)[] = [
+const MAX_CELLS = 256;
+const MAX_CELL_V = 10;
+// A "replay" older than this is a broken clock, not a buffered reading.
+const MAX_REPLAY_AGE_MS = 30 * 86_400_000;
+
+export const ALARM_KEYS: (keyof Alarms)[] = [
   "over_current",
   "over_discharge",
   "over_charge",
@@ -83,11 +99,34 @@ function deviceTimeMs(doc: Record<string, unknown>): number | null {
   return null;
 }
 
+/**
+ * Which time a reading is filed under. Arrival time is safe but wrong for
+ * readings replayed from the device's offline buffer; the device clock is
+ * right for those but only once NTP works (the current firmware is hours
+ * off). So: device time when the firmware says it is synced and it is not in
+ * the future, and for live (non-replay) messages also close to arrival.
+ */
+export function orderingTime(
+  receivedAt: number,
+  deviceTime: number | null,
+  timeOk: boolean,
+  replay: boolean,
+  toleranceS: number,
+): number {
+  if (!timeOk || deviceTime === null) return receivedAt;
+  const skewMs = deviceTime - receivedAt;
+  if (skewMs > toleranceS * 1000) return receivedAt;
+  if (skewMs < -MAX_REPLAY_AGE_MS) return receivedAt;
+  if (!replay && skewMs < -toleranceS * 1000) return receivedAt;
+  return deviceTime;
+}
+
 export function parseReading(
   doc: unknown,
   packId: string,
   topic: string,
   receivedAt: number,
+  clockToleranceS = 300,
 ): Reading {
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
     throw new PayloadError("payload is not a JSON object");
@@ -103,6 +142,14 @@ export function parseReading(
   const rawCells = Array.isArray(t.cell_voltages_v)
     ? (t.cell_voltages_v as unknown[]).map((v) => num(v) ?? 0)
     : [];
+  // Bounds keep one garbage payload from failing a whole database batch
+  // (cells are stored as smallint millivolts).
+  if (rawCells.length > MAX_CELLS) {
+    throw new PayloadError(`${rawCells.length} cells, more than ${MAX_CELLS}`);
+  }
+  if (rawCells.some((v) => v < 0 || v > MAX_CELL_V)) {
+    throw new PayloadError(`cell voltage outside 0–${MAX_CELL_V} V`);
+  }
   let last = rawCells.length - 1;
   while (last >= 0 && rawCells[last] <= 0) last--;
   const cells = rawCells.slice(0, last + 1);
@@ -131,7 +178,10 @@ export function parseReading(
 
   const moduleTemps = (Array.isArray(t.module_temps_c) ? t.module_temps_c : [])
     .map((v, i) => ({ index: i + 1, value: num(v) }))
-    .filter((m): m is { index: number; value: number } => m.value !== null && m.value !== 0);
+    .filter(
+      (m): m is { index: number; value: number } =>
+        m.value !== null && m.value !== 0 && m.value > -60 && m.value < 300,
+    );
 
   const a = (d.alarms ?? {}) as Record<string, unknown>;
   const alarms = Object.fromEntries(
@@ -140,14 +190,21 @@ export function parseReading(
 
   const deviceTime = deviceTimeMs(d);
   const hostTemp = num(t.host_temp_c);
+  const timeOk = d.time_ok === true;
+  const replay = d.replay === true;
+  const seq = num(d.seq);
 
   return {
     packId,
     topic,
+    ts: orderingTime(receivedAt, deviceTime, timeOk, replay, clockToleranceS),
     receivedAt,
     deviceTime,
     clockSkewS:
       deviceTime === null ? null : Math.round((deviceTime - receivedAt) / 1000),
+    timeOk,
+    replay,
+    seq: seq !== null && Number.isInteger(seq) && Math.abs(seq) < 2 ** 31 ? seq : null,
     status: typeof d.system_status === "string" ? d.system_status : "UNKNOWN",
     schema: num(d.schema) ?? 1,
     voltage,

@@ -1,0 +1,118 @@
+# Production stack on the droplet (/opt/battery-iot). Images come from GHCR,
+# built by .github/workflows/docker.yml; nothing is built here.
+#
+#   ./deploy/deploy.sh                 from your machine: copy these files, pull, restart
+#   docker compose pull && docker compose up -d     on the droplet
+#   TAG=sha-abc1234 docker compose up -d            roll back to an earlier build
+#
+# Settings and secrets come from .env next to this file (see .env.example here).
+
+name: battery-iot
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app-env: &app-env
+  env_file: .env
+
+services:
+  db:
+    image: timescale/timescaledb:2.30.2-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bms
+      POSTGRES_USER: bms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      NO_TS_TUNE: "true"
+    # Tuned for ~320 MB. See PLAN.md section 3.
+    command: >
+      postgres
+      -c shared_buffers=128MB
+      -c effective_cache_size=384MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+      -c max_connections=30
+      -c max_worker_processes=8
+      -c max_parallel_workers=2
+      -c max_parallel_workers_per_gather=1
+      -c timescaledb.max_background_workers=4
+      -c timescaledb.telemetry_level=off
+      -c wal_buffers=4MB
+      -c max_wal_size=512MB
+      -c min_wal_size=64MB
+      -c checkpoint_timeout=15min
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    ports:
+      # psql over an SSH tunnel only; never public.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bms -d bms"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 320m
+    logging: *logging
+
+  ingest:
+    <<: *app-env
+    image: ghcr.io/aniruddhaghodke/battery-iot-ingest:${TAG:-latest}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://bms:${POSTGRES_PASSWORD}@db:5432/bms
+      STATUS_PORT: "3101"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3101/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    stop_grace_period: 15s
+    mem_limit: 150m
+    logging: *logging
+
+  web:
+    <<: *app-env
+    image: ghcr.io/aniruddhaghodke/battery-iot-web:${TAG:-latest}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://bms:${POSTGRES_PASSWORD}@db:5432/bms
+      INGEST_URL: http://ingest:3101
+    depends_on:
+      # ingest applies the migrations, so it must be up first.
+      ingest:
+        condition: service_healthy
+    mem_limit: 300m
+    logging: *logging
+
+  # HTTPS in front of web. Gets and renews the Let's Encrypt certificate itself.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:?set BASIC_AUTH_USER in .env}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:?set BASIC_AUTH_HASH in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    mem_limit: 64m
+    logging: *logging
+
+volumes:
+  dbdata:
+  caddy_data:
+  caddy_config:
