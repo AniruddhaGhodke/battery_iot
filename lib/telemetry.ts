@@ -84,6 +84,21 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+// Pack-level figures are stored as Postgres real. A value this large is a
+// broken sensor or garbage, and one that does not fit real fails the whole
+// database batch, so the field is dropped instead (like cells, below).
+const MAX_MEASURE = 1e6;
+
+function measure(v: unknown): number | null {
+  const n = num(v);
+  return n !== null && Math.abs(n) < MAX_MEASURE ? n : null;
+}
+
+/** Text Postgres accepts in text and jsonb: no NUL, no lone surrogates. */
+function cleanText(s: string): string {
+  return s.replaceAll("\0", "").toWellFormed();
+}
+
 function round(v: number, dp: number): number {
   const f = 10 ** dp;
   return Math.round(v * f) / f;
@@ -158,8 +173,8 @@ export function parseReading(
     .filter(Boolean);
   const live = cells.filter((v) => v > 0);
 
-  const voltage = num(t.total_voltage_v);
-  const current = num(t.total_current_a);
+  const voltage = measure(t.total_voltage_v);
+  const current = measure(t.total_current_a);
 
   let cellMin = null,
     cellMax = null,
@@ -189,7 +204,8 @@ export function parseReading(
   ) as Alarms;
 
   const deviceTime = deviceTimeMs(d);
-  const hostTemp = num(t.host_temp_c);
+  const hostTemp = measure(t.host_temp_c);
+  const remainingAh = measure(t.remaining_capacity_ah);
   const timeOk = d.time_ok === true;
   const replay = d.replay === true;
   const seq = num(d.seq);
@@ -205,13 +221,13 @@ export function parseReading(
     timeOk,
     replay,
     seq: seq !== null && Number.isInteger(seq) && Math.abs(seq) < 2 ** 31 ? seq : null,
-    status: typeof d.system_status === "string" ? d.system_status : "UNKNOWN",
+    status: typeof d.system_status === "string" ? cleanText(d.system_status) : "UNKNOWN",
     schema: num(d.schema) ?? 1,
     voltage,
     current,
     power: voltage !== null && current !== null ? round(voltage * current, 1) : null,
-    soc: num(t.soc_percent),
-    remainingAh: num(t.remaining_capacity_ah) === null ? null : round(num(t.remaining_capacity_ah)!, 2),
+    soc: measure(t.soc_percent),
+    remainingAh: remainingAh === null ? null : round(remainingAh, 2),
     // 0 almost always means "sensor not fitted", not 0 degC.
     hostTemp: hostTemp === 0 ? null : hostTemp,
     cells,

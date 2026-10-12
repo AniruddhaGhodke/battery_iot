@@ -14,7 +14,7 @@ import mqtt from "mqtt";
 import postgres from "postgres";
 import { migrate } from "../db/migrate.ts";
 import type { IngestStatus } from "../lib/ingest-status.ts";
-import { parseReading, PayloadError } from "../lib/telemetry.ts";
+import { parseReading, PayloadError, type Reading } from "../lib/telemetry.ts";
 import { config } from "./config.ts";
 import { PackRegistry } from "./packs.ts";
 import { Writer } from "./writer.ts";
@@ -80,24 +80,28 @@ writer.start();
 // is a duplicate (QoS 1 redelivery).
 const lastArrivalTs = new Map<number, number>();
 
-function accept(packId: number | null, doc: unknown, deviceId: string, topic: string, receivedAt: number) {
+function parse(doc: unknown, deviceId: string, topic: string, receivedAt: number): Reading | null {
+  try {
+    return parseReading(doc, deviceId, topic, receivedAt, config.clockToleranceS);
+  } catch (e) {
+    msgStats.rejected.badPayload++;
+    msgStats.lastRejection = `${deviceId}: ${e instanceof PayloadError ? e.message : (e as Error).message}`;
+    return null;
+  }
+}
+
+function store(packId: number | null, reading: Reading) {
   if (packId === null) {
     msgStats.rejected.notAllowed++;
     return;
   }
-  try {
-    const reading = parseReading(doc, deviceId, topic, receivedAt, config.clockToleranceS);
-    if (reading.ts === reading.receivedAt) {
-      const prev = lastArrivalTs.get(packId) ?? 0;
-      if (reading.ts <= prev) reading.ts = prev + 1;
-      lastArrivalTs.set(packId, reading.ts);
-    }
-    writer.push(packId, reading);
-    msgStats.accepted++;
-  } catch (e) {
-    msgStats.rejected.badPayload++;
-    msgStats.lastRejection = `${deviceId}: ${e instanceof PayloadError ? e.message : (e as Error).message}`;
+  if (reading.ts === reading.receivedAt) {
+    const prev = lastArrivalTs.get(packId) ?? 0;
+    if (reading.ts <= prev) reading.ts = prev + 1;
+    lastArrivalTs.set(packId, reading.ts);
   }
+  writer.push(packId, reading);
+  msgStats.accepted++;
 }
 
 function handleMessage(topic: string, payload: Buffer) {
@@ -126,10 +130,17 @@ function handleMessage(topic: string, payload: Buffer) {
   }
 
   const id = packs.lookup(deviceId);
-  if (id instanceof Promise) {
-    void id.then((pid) => accept(pid, doc, deviceId, topic, receivedAt));
+  if (id === null) {
+    msgStats.rejected.notAllowed++;
+    return;
+  }
+  const reading = parse(doc, deviceId, topic, receivedAt);
+  if (!reading) return;
+  if (id === undefined) {
+    // New device, auto-register on: registered only now its payload is valid.
+    void packs.register(deviceId).then((pid) => store(pid, reading));
   } else {
-    accept(id, doc, deviceId, topic, receivedAt);
+    store(id, reading);
   }
 }
 

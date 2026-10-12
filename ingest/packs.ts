@@ -54,14 +54,21 @@ export class PackRegistry {
   }
 
   /**
-   * Database id for an accepted device, or null if it is not allowed.
-   * Synchronous for known devices: this runs on every message.
+   * Database id for an accepted device, null if it is not allowed, or
+   * undefined for a new device that may be registered (auto-register on).
+   * The caller registers it only once its payload is valid, so garbage
+   * does not create packs. Synchronous: this runs on every message.
    */
-  lookup(deviceId: string): number | null | Promise<number | null> {
+  lookup(deviceId: string): number | null | undefined {
     const e = this.byDevice.get(deviceId);
     if (e) return e.enabled ? e.id : this.reject(deviceId);
     if (!this.autoRegister) return this.reject(deviceId);
-    return this.register(deviceId).then((r) => (r ? r.id : null));
+    return undefined;
+  }
+
+  /** Adds a new device to the packs table. Its database id, or null if disabled or failed. */
+  register(deviceId: string): Promise<number | null> {
+    return this.insert(deviceId).then((r) => (r?.enabled ? r.id : null));
   }
 
   private reject(deviceId: string): null {
@@ -75,7 +82,7 @@ export class PackRegistry {
     return null;
   }
 
-  private register(deviceId: string): Promise<Entry | null> {
+  private insert(deviceId: string): Promise<Entry | null> {
     let p = this.registering.get(deviceId);
     if (!p) {
       p = this.sql<{ id: number; enabled: boolean }[]>`
@@ -85,7 +92,7 @@ export class PackRegistry {
         .then(([row]) => {
           this.byDevice.set(deviceId, row);
           console.log(`[packs] registered ${deviceId}`);
-          return row.enabled ? row : null;
+          return row;
         })
         .catch((e) => {
           console.warn(`[packs] could not register ${deviceId}: ${(e as Error).message}`);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { orderingTime, parseReading, PayloadError } from "../lib/telemetry.ts";
-import { toRow } from "../ingest/writer.ts";
+import { toRow, Writer } from "../ingest/writer.ts";
 
 const NOW = Date.UTC(2026, 9, 3, 12, 0, 0);
 
@@ -59,6 +59,25 @@ describe("parseReading", () => {
     );
   });
 
+  it("drops pack figures too large for the database instead of failing the batch", () => {
+    const r = parseReading(
+      payload({}, { total_voltage_v: 1e300, total_current_a: -1e7, soc_percent: 1e39, remaining_capacity_ah: 1e300, host_temp_c: 1e300 }),
+      "P", "t", NOW,
+    );
+    assert.equal(r.voltage, null);
+    assert.equal(r.current, null);
+    assert.equal(r.power, null);
+    assert.equal(r.soc, null);
+    assert.equal(r.remainingAh, null);
+    assert.equal(r.hostTemp, null);
+    assert.equal(r.sumMismatchV, null);
+  });
+
+  it("cleans status text Postgres would refuse (NUL, lone surrogate)", () => {
+    assert.equal(parseReading(payload({ system_status: "ON\u0000LINE" }), "P", "t", NOW).status, "ONLINE");
+    assert.equal(parseReading(payload({ system_status: "A\ud800B" }), "P", "t", NOW).status, "A\ufffdB");
+  });
+
   it("files a reading from an unsynced clock under arrival time", () => {
     const r = parseReading(payload(), "P", "t", NOW);
     assert.equal(r.ts, NOW);
@@ -110,5 +129,52 @@ describe("toRow", () => {
   it("drops a device time that was never set", () => {
     const row = toRow(1, parseReading(payload({ unix_timestamp: 5 }), "P", "t", NOW));
     assert.equal(row.device_at, null);
+  });
+});
+
+describe("Writer", () => {
+  // Minimal stand-in for postgres.js: tx(rows, ...cols) builds a helper,
+  // tx`...` runs a statement. Readings with voltage -1 are refused like a
+  // value out of range (SQLSTATE 22003), failing the whole statement.
+  function fakeSql() {
+    const stored: { pack_id: number; voltage: number | null }[] = [];
+    const tx = (first: unknown, ...rest: unknown[]) => {
+      if (!(Array.isArray(first) && "raw" in first)) return { rows: first };
+      if (!first[0].includes("insert into readings")) return { count: 0 };
+      const rows = (rest[0] as { rows: { pack_id: number; voltage: number | null }[] }).rows;
+      if (rows.some((r) => r.voltage === -1)) {
+        throw Object.assign(new Error("value out of range"), { code: "22003" });
+      }
+      stored.push(...rows);
+      return { count: rows.length };
+    };
+    const sql = { begin: async (fn: (t: typeof tx) => unknown) => fn(tx) };
+    return { sql: sql as never, stored };
+  }
+
+  const reading = (voltage: number) => ({ ...parseReading(payload(), "P", "t", NOW), voltage });
+
+  it("loses only the row the database refuses, not the rest of its batch", async () => {
+    const { sql, stored } = fakeSql();
+    const w = new Writer(sql, { intervalMs: 1000, maxRows: 100, bufferMax: 1000 });
+    w.push(1, reading(13.2));
+    w.push(2, reading(-1));
+    w.push(3, reading(13.3));
+    await w.flush();
+    assert.deepEqual(stored.map((r) => r.pack_id), [1, 3]);
+    assert.equal(w.stats.written, 2);
+    assert.equal(w.stats.dropped, 1);
+    assert.equal(w.stats.buffered, 0);
+  });
+
+  it("writes the whole batch in one statement when nothing is refused", async () => {
+    const { sql, stored } = fakeSql();
+    const w = new Writer(sql, { intervalMs: 1000, maxRows: 100, bufferMax: 1000 });
+    w.push(1, reading(13.2));
+    w.push(2, reading(13.3));
+    await w.flush();
+    assert.equal(stored.length, 2);
+    assert.equal(w.stats.dropped, 0);
+    assert.equal(w.stats.lastError, null);
   });
 });

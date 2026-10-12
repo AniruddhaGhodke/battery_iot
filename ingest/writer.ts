@@ -36,6 +36,14 @@ const SANE_TIME = [946_684_800_000, 4_102_444_800_000];
 
 const mv = (v: number | null) => (v === null ? null : Math.round(v * 1000));
 
+/**
+ * Postgres data or constraint error (SQLSTATE class 22 or 23): retrying the
+ * same rows fails forever. Anything else (connection, timeout) is worth a retry.
+ */
+function isDataError(e: unknown): boolean {
+  return /^2[23]/.test((e as { code?: string }).code ?? "");
+}
+
 export function toRow(packId: number, r: Reading) {
   const temps: (number | null)[] = [];
   for (const m of r.moduleTemps) temps[m.index - 1] = Math.round(m.value * 10);
@@ -137,67 +145,94 @@ export class Writer {
     const batch = this.buffer.splice(0, this.maxRows);
     const started = performance.now();
     try {
-      const rows = batch.map((p) => toRow(p.packId, p.reading));
-
-      // Newest reading and message count per pack, for pack_latest.
-      const latest = new Map<number, { p: Pending; n: number; firstSeen: number; lastSeen: number }>();
-      for (const p of batch) {
-        const at = p.reading.receivedAt;
-        const cur = latest.get(p.packId);
-        if (!cur) {
-          latest.set(p.packId, { p, n: 1, firstSeen: at, lastSeen: at });
-        } else {
-          cur.n++;
-          if (p.reading.ts >= cur.p.reading.ts) cur.p = p;
-          cur.firstSeen = Math.min(cur.firstSeen, at);
-          cur.lastSeen = Math.max(cur.lastSeen, at);
-        }
-      }
-      const latestRows = [...latest.entries()].map(([packId, { p, n, firstSeen, lastSeen }]) => ({
-        pack_id: packId,
-        ts: new Date(p.reading.ts),
-        received_at: new Date(lastSeen),
-        first_seen: new Date(firstSeen),
-        messages: n,
-        reading: p.reading as unknown as Record<string, never>,
-      }));
-
-      const inserted = await this.sql.begin(async (tx) => {
-        const res = await tx`
-          insert into readings ${tx(rows, ...COLUMNS)}
-          on conflict do nothing`;
-        await tx`
-          insert into pack_latest ${tx(latestRows, "pack_id", "ts", "received_at", "first_seen", "messages", "reading")}
-          on conflict (pack_id) do update set
-            messages    = pack_latest.messages + excluded.messages,
-            received_at = greatest(pack_latest.received_at, excluded.received_at),
-            reading     = case when excluded.ts >= pack_latest.ts then excluded.reading else pack_latest.reading end,
-            ts          = greatest(pack_latest.ts, excluded.ts)`;
-        return res.count;
-      });
-
+      const inserted = await this.insert(batch);
       this.stats.written += inserted;
       this.stats.duplicates += batch.length - inserted;
-      this.stats.flushes++;
-      this.stats.lastWriteAt = Date.now();
-      this.stats.lastFlushMs = Math.round(performance.now() - started);
       this.stats.lastError = null;
-      if (this.buffer.length >= this.maxRows) setImmediate(() => void this.flush());
     } catch (e) {
       this.stats.errors++;
       this.stats.lastError = (e as Error).message;
-      const code = (e as { code?: string }).code ?? "";
-      if (/^2[23]/.test(code)) {
-        // Data or constraint error: retrying the same rows fails forever and
-        // blocks everything behind them. Drop this batch, keep going.
-        this.stats.dropped += batch.length;
-        console.warn(`[db] dropped ${batch.length} readings the database rejected (${code}): ${(e as Error).message}`);
+      if (isDataError(e)) {
+        // One row the database refuses fails the whole multi-row insert.
+        // Write this batch row by row so only the bad rows are lost, not
+        // the other packs' readings from the same second.
+        await this.writeEach(batch);
+      } else {
+        // Connection-type error: put the batch back in front, retry next tick.
+        this.requeue(batch, e);
         return;
       }
-      // Connection-type error: put the batch back in front, retry next tick.
-      this.buffer.unshift(...batch);
-      this.trim();
-      console.warn(`[db] write failed, ${this.buffer.length} readings buffered: ${(e as Error).message}`);
     }
+    this.stats.flushes++;
+    this.stats.lastWriteAt = Date.now();
+    this.stats.lastFlushMs = Math.round(performance.now() - started);
+    if (this.buffer.length >= this.maxRows) setImmediate(() => void this.flush());
+  }
+
+  private async writeEach(batch: Pending[]) {
+    for (let i = 0; i < batch.length; i++) {
+      try {
+        const inserted = await this.insert([batch[i]]);
+        this.stats.written += inserted;
+        this.stats.duplicates += 1 - inserted;
+      } catch (e) {
+        if (!isDataError(e)) {
+          this.requeue(batch.slice(i), e);
+          return;
+        }
+        this.stats.dropped++;
+        this.stats.lastError = (e as Error).message;
+        const code = (e as { code?: string }).code;
+        console.warn(`[db] dropped a reading from pack ${batch[i].packId} the database rejected (${code}): ${(e as Error).message}`);
+      }
+    }
+  }
+
+  private requeue(rows: Pending[], e: unknown) {
+    this.buffer.unshift(...rows);
+    this.trim();
+    console.warn(`[db] write failed, ${this.buffer.length} readings buffered: ${(e as Error).message}`);
+  }
+
+  /** Inserts the readings and updates pack_latest in one transaction. Returns rows inserted. */
+  private async insert(batch: Pending[]): Promise<number> {
+    const rows = batch.map((p) => toRow(p.packId, p.reading));
+
+    // Newest reading and message count per pack, for pack_latest.
+    const latest = new Map<number, { p: Pending; n: number; firstSeen: number; lastSeen: number }>();
+    for (const p of batch) {
+      const at = p.reading.receivedAt;
+      const cur = latest.get(p.packId);
+      if (!cur) {
+        latest.set(p.packId, { p, n: 1, firstSeen: at, lastSeen: at });
+      } else {
+        cur.n++;
+        if (p.reading.ts >= cur.p.reading.ts) cur.p = p;
+        cur.firstSeen = Math.min(cur.firstSeen, at);
+        cur.lastSeen = Math.max(cur.lastSeen, at);
+      }
+    }
+    const latestRows = [...latest.entries()].map(([packId, { p, n, firstSeen, lastSeen }]) => ({
+      pack_id: packId,
+      ts: new Date(p.reading.ts),
+      received_at: new Date(lastSeen),
+      first_seen: new Date(firstSeen),
+      messages: n,
+      reading: p.reading as unknown as Record<string, never>,
+    }));
+
+    return this.sql.begin(async (tx) => {
+      const res = await tx`
+        insert into readings ${tx(rows, ...COLUMNS)}
+        on conflict do nothing`;
+      await tx`
+        insert into pack_latest ${tx(latestRows, "pack_id", "ts", "received_at", "first_seen", "messages", "reading")}
+        on conflict (pack_id) do update set
+          messages    = pack_latest.messages + excluded.messages,
+          received_at = greatest(pack_latest.received_at, excluded.received_at),
+          reading     = case when excluded.ts >= pack_latest.ts then excluded.reading else pack_latest.reading end,
+          ts          = greatest(pack_latest.ts, excluded.ts)`;
+      return res.count;
+    });
   }
 }

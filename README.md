@@ -151,7 +151,7 @@ payload unchanged (schema 2, see [Payload](#payload)).
 | `MQTT_TOPIC` | `emspl/a7f3c2/+/data` | `+` matches one level |
 | `MQTT_CLIENT_ID` | `bms-ingest-<hostname>` | Fixed, so the broker can keep the session. Must differ from the droplet's ingest |
 | `ALLOWED_DEVICES` | empty | `device_id`s added to the `packs` table at startup. **Only enabled packs are stored** |
-| `AUTO_REGISTER_DEVICES` | `false` | Store any new `device_id` |
+| `AUTO_REGISTER_DEVICES` | `false` | Store any new `device_id` once it sends a valid reading. On in production: the broker login already decides who can publish. A pack with `enabled = false` stays blocked |
 | `STALE_AFTER_S` | 60 | No message for this long = offline |
 | `CLOCK_TOLERANCE_S` | 300 | How close a synced device clock must be to arrival time to be used |
 | `DATABASE_URL` | `postgres://bms:bms_local@localhost:5433/bms` | Set by Compose inside Docker |
