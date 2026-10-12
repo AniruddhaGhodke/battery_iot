@@ -57,6 +57,22 @@ services:
     mem_limit: 320m
     logging: *logging
 
+  # MQTT broker the packs publish to. Plain TCP 1883 from anywhere; logins
+  # and ACL in ./mosquitto (see the comments in mosquitto.conf). auth/passwd
+  # exists only here on the droplet.
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/acl:/mosquitto/config/acl:ro
+      - ./mosquitto/auth:/mosquitto/auth
+      - mosquitto_data:/mosquitto/data
+    mem_limit: 64m
+    logging: *logging
+
   ingest:
     <<: *app-env
     image: ghcr.io/aniruddhaghodke/battery-iot-ingest:${TAG:-latest}
@@ -67,6 +83,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      mosquitto:
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3101/health"]
       interval: 10s
@@ -109,10 +127,11 @@ services:
       - caddy_config:/config
     depends_on:
       - web
-    mem_limit: 64m
+    mem_limit: 96m
     logging: *logging
 
 volumes:
   dbdata:
+  mosquitto_data:
   caddy_data:
   caddy_config:

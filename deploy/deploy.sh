@@ -13,5 +13,8 @@ DIR=/opt/battery-iot
 TAG="${TAG:-latest}"
 
 cd "$(dirname "$0")"
+# mosquitto/auth (the broker logins) lives only on the droplet and is not copied.
+ssh -i "$KEY" "$HOST" "mkdir -p $DIR/mosquitto"
 scp -i "$KEY" docker-compose.yml Caddyfile "$HOST:$DIR/"
+scp -i "$KEY" mosquitto/mosquitto.conf mosquitto/acl "$HOST:$DIR/mosquitto/"
 ssh -i "$KEY" "$HOST" "cd $DIR && export TAG=$TAG && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f && docker compose ps"

@@ -140,6 +140,9 @@ const client = mqtt.connect(config.mqttUrl, {
   // Persistent session: the broker queues QoS 1 messages while we restart.
   clean: false,
   reconnectPeriod: 4000,
+  // Keep retrying after "Not authorized" too (mqtt.js gives up by default),
+  // so a fixed broker login is picked up without restarting ingest.
+  reconnectOnConnackError: true,
   connectTimeout: 10_000,
 });
 

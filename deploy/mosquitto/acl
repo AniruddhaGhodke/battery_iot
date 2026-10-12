@@ -1,0 +1,11 @@
+# Who may do what. Usernames match the accounts in passwd (droplet only).
+# One shared account for all packs for now; per-pack accounts can replace it
+# later (TODO 7), e.g. "pattern write emspl/a7f3c2/%u/data".
+
+# The packs: publish telemetry, nothing else.
+user emspl-device
+topic write emspl/a7f3c2/+/data
+
+# The ingest worker: read telemetry, nothing else.
+user bms-ingest
+topic read emspl/a7f3c2/+/data

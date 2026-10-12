@@ -88,15 +88,15 @@ Reference: `bms_iot/server/notify.py`.
 
 ## 7. Broker security — before any real pack goes to site
 
-`broker.emqx.io` is public: anyone can read your telemetry and publish fake
-readings to your topic. The allowlist limits the damage; it is not security.
-
-- [ ] Move to a private broker — EMQX Cloud Serverless (free tier) or a
-      Mosquitto on the DigitalOcean droplet
-- [ ] TLS on port 8883 (also gets through firewalls that block 1883)
-- [ ] Separate credentials for the server and for each device
-- [ ] ACL: each device may only publish to its own topic
-- [ ] Change `MQTT_URL`, `MQTT_USERNAME`, `MQTT_PASSWORD` — no code change
+- [x] Move to a private broker: Mosquitto on the droplet, plain TCP 1883
+      (as the hardware spec asks), no anonymous access
+- [x] Separate credentials for the server (`bms-ingest`, read-only) and the
+      devices (`emspl-device`, write-only, one shared login)
+- [ ] TLS on port 8883 (also gets through firewalls that block 1883).
+      Until then, logins and telemetry cross the network in clear text
+- [ ] One login per pack, and an ACL so each may only publish to its own topic
+      (`pattern write emspl/a7f3c2/%u/data`, once topic names match packs)
+- [ ] Reflash `EM_PACK_16S_03` for the new broker (it was on `broker.emqx.io`)
 
 ## 8. Remote commands — deferred; only after step 7
 
@@ -165,7 +165,7 @@ Reference: `bms_iot/DEPLOY_DIGITALOCEAN.md`.
 - Readings filed by arrival time can't be deduplicated: a QoS 1 redelivery
   is stored twice. Fixed once firmware sends `time_ok` (or `seq`)
 - No auth: anyone who can reach port 3100 sees the data. Fine on localhost only
-- Public broker (see step 7)
+- Broker without TLS (see step 7)
 - On the iPhone hotspot, DNS must be 1.1.1.1 or the broker won't resolve
 - The reference code (`bms_iot`, `bms192s`) mentioned below isn't in this
   checkout; items are built from this file instead

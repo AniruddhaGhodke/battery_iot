@@ -17,7 +17,8 @@ function int(raw: string | undefined, fallback: number): number {
 export const config = {
   databaseUrl: process.env.DATABASE_URL || "postgres://bms:bms_local@localhost:5433/bms",
 
-  mqttUrl: process.env.MQTT_URL || "mqtt://broker.emqx.io:1883",
+  // Our Mosquitto on the droplet. In Docker there, MQTT_URL is mqtt://mosquitto:1883.
+  mqttUrl: process.env.MQTT_URL || "mqtt://159-89-160-225.sslip.io:1883",
   mqttUsername: process.env.MQTT_USERNAME || undefined,
   mqttPassword: process.env.MQTT_PASSWORD || undefined,
   mqttTopic: process.env.MQTT_TOPIC || "emspl/a7f3c2/+/data",
@@ -29,8 +30,8 @@ export const config = {
   // Seeded into the packs table at startup. Packs can be enabled or disabled
   // in the database after that.
   allowedDevices: list(process.env.ALLOWED_DEVICES),
-  // Register any unknown device_id automatically. Convenient on a private
-  // broker; leave off on a public one.
+  // Register any unknown device_id automatically. Only sensible now that the
+  // broker needs a login; still off by default.
   autoRegister: process.env.AUTO_REGISTER_DEVICES === "true",
 
   // Device clock is trusted for ordering only when it says it is synced and

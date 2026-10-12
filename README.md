@@ -5,7 +5,8 @@ pack publishes JSON over MQTT. An ingest worker stores every reading in
 Postgres + TimescaleDB, and a Next.js app shows it.
 
 ```
-ESP32 ──publish──► broker.emqx.io:1883  (topic emspl/a7f3c2/+/data)
+ESP32 ──publish──► mosquitto on the droplet, 159-89-160-225.sslip.io:1883
+                   (login required, topic emspl/a7f3c2/+/data)
                           │
                           ▼  QoS 1, persistent session
                  ingest (Node worker) ── validate, parse, batch once per second
@@ -86,8 +87,9 @@ Other commands:
 ## Deploy
 
 Production runs on a DigitalOcean droplet (`159.89.160.225`, `/opt/battery-iot`)
-from [`deploy/docker-compose.yml`](deploy/docker-compose.yml): db, ingest, web,
-and Caddy for HTTPS on https://159-89-160-225.sslip.io (basic auth).
+from [`deploy/docker-compose.yml`](deploy/docker-compose.yml): db, the MQTT
+broker (Mosquitto, port 1883), ingest, web, and Caddy for HTTPS on
+https://159-89-160-225.sslip.io (basic auth).
 
 1. Push to `main`. GitHub Actions ([`.github/workflows/docker.yml`](.github/workflows/docker.yml))
    builds both images and pushes them to GHCR, tagged `latest` and `sha-<commit>`.
@@ -108,16 +110,48 @@ docker compose exec db psql -U bms -d bms
 docker stats --no-stream             # memory against the mem_limits
 ```
 
+### Broker accounts
+
+The broker refuses anonymous clients. [`deploy/mosquitto/acl`](deploy/mosquitto/acl)
+defines two accounts:
+
+| User | May | Used by |
+|---|---|---|
+| `emspl-device` | publish to `emspl/a7f3c2/+/data` only | every pack (one shared login for now) |
+| `bms-ingest` | subscribe to `emspl/a7f3c2/+/data` only | ingest (`MQTT_USERNAME` / `MQTT_PASSWORD` in `.env`) |
+
+The passwords are only in `/opt/battery-iot/mosquitto/auth/passwd` (hashed)
+on the droplet, plus `MQTT_PASSWORD` in `.env` for ingest. They are never in git. To set or
+change one, on the droplet:
+
+```bash
+cd /opt/battery-iot
+docker compose run --rm mosquitto mosquitto_passwd -b /mosquitto/auth/passwd <user> '<password>'
+docker compose restart mosquitto     # reload logins (ingest reconnects by itself)
+```
+
+For `bms-ingest`, put the same password in `.env` as `MQTT_PASSWORD` and run
+`docker compose up -d ingest`. For `emspl-device`, every pack must be
+reflashed with the new password.
+
+Per-pack accounts (each pack may only publish to its own topic) are a later
+step; see TODO 7.
+
+**Firmware settings:** host `159-89-160-225.sslip.io` (or `159.89.160.225`),
+port **1883** plain TCP (no TLS yet; port 80 is the dashboard's), username
+`emspl-device`, password from the droplet, topic `emspl/a7f3c2/<pack>/data`,
+payload unchanged (schema 2, see [Payload](#payload)).
+
 ## Configuration (`.env.local`)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MQTT_URL` | `mqtt://broker.emqx.io:1883` | Broker the device publishes to |
-| `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | Not needed on the public broker |
+| `MQTT_URL` | `mqtt://159-89-160-225.sslip.io:1883` | Broker the device publishes to. On the droplet `mqtt://mosquitto:1883` |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | The `bms-ingest` login (see [Broker accounts](#broker-accounts)) |
 | `MQTT_TOPIC` | `emspl/a7f3c2/+/data` | `+` matches one level |
-| `MQTT_CLIENT_ID` | `bms-ingest-<hostname>` | Fixed, so the broker can keep the session. Unique on a public broker |
+| `MQTT_CLIENT_ID` | `bms-ingest-<hostname>` | Fixed, so the broker can keep the session. Must differ from the droplet's ingest |
 | `ALLOWED_DEVICES` | empty | `device_id`s added to the `packs` table at startup. **Only enabled packs are stored** |
-| `AUTO_REGISTER_DEVICES` | `false` | Store any new `device_id`. Only on a private broker |
+| `AUTO_REGISTER_DEVICES` | `false` | Store any new `device_id` |
 | `STALE_AFTER_S` | 60 | No message for this long = offline |
 | `CLOCK_TOLERANCE_S` | 300 | How close a synced device clock must be to arrival time to be used |
 | `DATABASE_URL` | `postgres://bms:bms_local@localhost:5433/bms` | Set by Compose inside Docker |
@@ -201,9 +235,10 @@ The dashboard's empty state names the cause. The usual ones:
 |---|---|
 | "Cannot reach the database" | `docker compose up -d db` |
 | "The ingest service is not running" | `npm run ingest:dev`, or `docker compose up -d` |
-| "Not connected to the MQTT broker", error `ENOTFOUND` | DNS. The mobile carrier's DNS blocks `broker.emqx.io`. Set DNS to `1.1.1.1` for that network, then restart ingest. Test with `nslookup broker.emqx.io` |
+| "Not connected to the MQTT broker", error `ENOTFOUND` | DNS. Some mobile carriers' DNS won't resolve the broker's hostname. Set DNS to `1.1.1.1` for that network, then restart ingest. Test with `nslookup 159-89-160-225.sslip.io` |
+| "Not connected to the MQTT broker", `Not authorized` | Wrong `MQTT_USERNAME` / `MQTT_PASSWORD`; see [Broker accounts](#broker-accounts) |
 | "Messages are arriving but all were rejected" | The `device_id` is not an enabled pack: add it to `ALLOWED_DEVICES`. The rejected ids are listed in `/api/status` under `ingest.packs.unknown` |
-| Connected, nothing arriving | Device off, or publishing to a different topic. Check in MQTTX |
+| Connected, nothing arriving | Device off, wrong login, or publishing to a different topic (the broker silently drops publishes the ACL doesn't allow). `docker compose logs mosquitto` on the droplet shows each device connecting |
 
 `curl -s localhost:3100/api/status` shows the raw counters.
 
