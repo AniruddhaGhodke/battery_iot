@@ -42,6 +42,24 @@ export type IngestStatus = {
     /** device_ids seen on the topic but not accepted. */
     unknown: { deviceId: string; count: number; lastSeen: number }[];
   };
+  /** WhatsApp alerts. Missing from an ingest older than the alerts feature. */
+  alerts?: AlertStatus;
+};
+
+export type AlertStatus = {
+  /** ALERTS_ENABLED=true */
+  enabled: boolean;
+  /** Token, phone number id and recipients are all set. */
+  configured: boolean;
+  recipients: number;
+  /** Messages sent (to at least one recipient), failed, and not sent (off, cooldown, cap). */
+  sent: number;
+  failed: number;
+  suppressed: number;
+  lastSentAt: number | null;
+  lastError: string | null;
+  /** Alerts raised right now. pack null = system. */
+  active: { pack: string | null; condition: string; since: number; notified: boolean }[];
 };
 
 /** Shape of the web app's GET /api/status. */

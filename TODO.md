@@ -2,7 +2,8 @@
 
 Step 1 (live dashboard from MQTT) and step 2 (persistent history, Docker)
 are done. The order we're working in, and why, is in [PLAN.md](PLAN.md).
-Alerts (3), notifications (6) and remote commands (8) are deferred: noted,
+Basic alerts with WhatsApp notifications are done (README, "WhatsApp
+alerts"); the rest of 3 and 6 and remote commands (8) are deferred: noted,
 not scheduled.
 
 The earlier Python implementation in `../bms_iot` already solves most of
@@ -34,15 +35,17 @@ given where useful.
 Reference: `bms_iot/server/alerts.py`, thresholds in `bms_iot/config/alerts.yaml`.
 
 **Per reading**
-- [ ] BMS alarm flags (over-current, over/under-voltage, over-temperature, string error)
+- [x] BMS alarm flags (over-current, over/under-voltage, over-temperature, string error)
 - [ ] Thresholds: cell min/max voltage, cell spread, pack voltage, current, temperature
-- [ ] Silent cell inside the string (sense-lead fault)
-- [ ] Pack offline — no message for N minutes
+- [x] Silent cell inside the string (sense-lead fault)
+- [x] Cell spread above a threshold
+- [x] Pack offline — no message for N minutes
+- [x] Server: MQTT broker or database unreachable
 - [ ] **Data integrity**: cells don't sum to pack voltage (caught the 60 V vs
       188.7 V test payload), power ≠ V×I, SOC ≠ remaining/rated
 - [ ] **Device clock** off by more than a tolerance (the real device was 3.7 h behind)
-- [ ] Hysteresis: an alert clears only after N clean readings
-- [ ] Dedup: one open alert per pack per rule
+- [x] Hysteresis: an alert clears only after it has been gone for a while
+- [x] Dedup: one open alert per pack per rule
 
 **Trends (need weeks of history)** — the preventive-maintenance part
 - [ ] Cell imbalance growth (spread slope, mV per week)
@@ -54,6 +57,7 @@ Reference: `bms_iot/server/alerts.py`, thresholds in `bms_iot/config/alerts.yaml
 
 **Workflow**
 - [ ] Alerts page: open / acknowledged / closed, acknowledge with a name
+      (data is already in `alert_active` / `alert_log`)
 - [ ] Every alert carries a recommended action, not just a title
 
 ## 4. Auth
@@ -81,10 +85,13 @@ Reference: `bms_iot/server/auth.py`.
 
 Reference: `bms_iot/server/notify.py`.
 
+- [x] WhatsApp (Meta Cloud API, one template, shared recipient list)
+- [ ] Per-pack recipients (customer site contacts)
 - [ ] Email (SMTP; Gmail needs an app password) and webhook (Slack/Teams/SMS gateway)
 - [ ] Critical alerts immediately; warnings batched into a digest
-- [ ] Quiet hours (IST), hourly rate limit
-- [ ] Only on the transition to open, never on every repeat
+- [ ] Quiet hours (IST)
+- [x] Hourly rate limit, flap cooldown
+- [x] Only on the transition to open, never on every repeat
 
 ## 7. Broker security — before any real pack goes to site
 

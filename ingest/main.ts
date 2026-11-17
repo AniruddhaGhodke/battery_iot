@@ -3,6 +3,9 @@
  *
  *   broker ──► validate + parse ──► Writer (batched inserts) ──► Postgres
  *
+ * Every accepted reading also goes to the alert engine (notifier.ts), which
+ * sends WhatsApp messages for alarms, silent packs and outages.
+ *
  * Also serves GET /status and /health on STATUS_PORT. In Docker that port
  * is only reachable from the web container, never published.
  *
@@ -16,8 +19,15 @@ import { migrate } from "../db/migrate.ts";
 import type { IngestStatus } from "../lib/ingest-status.ts";
 import { parseReading, PayloadError, type Reading } from "../lib/telemetry.ts";
 import { config } from "./config.ts";
+import { Notifier, sendTestAlert } from "./notifier.ts";
 import { PackRegistry } from "./packs.ts";
 import { Writer } from "./writer.ts";
+
+// `node ingest.mjs --test-alert` (in the container) or `npm run alert:test`:
+// send one WhatsApp test message and exit, without touching MQTT.
+if (process.argv.includes("--test-alert")) {
+  process.exit((await sendTestAlert(config.alerts)) ? 0 : 1);
+}
 
 const PACK_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 
@@ -73,6 +83,18 @@ const writer = new Writer(sql, {
 });
 writer.start();
 
+const notifier = new Notifier(sql, config.alerts);
+await notifier.start();
+const alertTimer = setInterval(() => {
+  notifier.tick(packs.enabledDevices(), {
+    mqttConnected: mqttStats.connected,
+    mqttError: mqttStats.lastError,
+    // Only an outage while readings pile up; a single bad row also sets lastError.
+    dbError: writer.stats.buffered > 0 ? writer.stats.lastError : null,
+    buffered: writer.stats.buffered,
+  });
+}, 5_000);
+
 // Last arrival-time ts per pack. When the broker delivers a queued backlog
 // (after an ingest restart) many messages arrive in the same millisecond;
 // without this they would collide on (pack_id, ts) and be dropped as
@@ -102,6 +124,7 @@ function store(packId: number | null, reading: Reading) {
   }
   writer.push(packId, reading);
   msgStats.accepted++;
+  notifier.observe(reading);
 }
 
 function handleMessage(topic: string, payload: Buffer) {
@@ -203,6 +226,7 @@ function status(): IngestStatus {
       autoRegister: config.autoRegister,
       unknown: [...packs.unknown.entries()].map(([deviceId, u]) => ({ deviceId, ...u })),
     },
+    alerts: { ...notifier.stats, active: notifier.active() },
   };
 }
 
@@ -226,6 +250,9 @@ async function shutdown(signal: string) {
   console.log(`[ingest] ${signal}: flushing ${writer.stats.buffered} buffered readings`);
   await new Promise<void>((r) => client.end(false, {}, () => r()));
   await writer.drain();
+  clearInterval(alertTimer);
+  // Let a message being sent finish, but don't outlive Docker's grace period.
+  await Promise.race([notifier.idle(), new Promise((r) => setTimeout(r, 5_000))]);
   packs.stop();
   server.close();
   await sql.end({ timeout: 5 });

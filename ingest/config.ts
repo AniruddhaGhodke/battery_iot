@@ -44,6 +44,33 @@ export const config = {
   bufferMaxRows: int(process.env.BUFFER_MAX_ROWS, 50_000),
 
   statusPort: int(process.env.STATUS_PORT, 3101),
+
+  // WhatsApp alerts (ingest/alerts.ts; README, "WhatsApp alerts"). Off unless
+  // ALERTS_ENABLED=true, so a local ingest never messages anyone. When off,
+  // alerts are still worked out, logged and stored in alert_log.
+  alerts: {
+    enabled: process.env.ALERTS_ENABLED === "true",
+    recipients: list(process.env.ALERT_RECIPIENTS),
+    whatsapp: {
+      token: process.env.WHATSAPP_TOKEN || "",
+      phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || "",
+      template: process.env.WHATSAPP_TEMPLATE || "battery_alert",
+      language: process.env.WHATSAPP_TEMPLATE_LANG || "en",
+      apiVersion: process.env.WHATSAPP_API_VERSION || "v26.0",
+    },
+    timeZone: process.env.ALERT_TIMEZONE || "Asia/Kolkata",
+    timeZoneLabel: process.env.ALERT_TIMEZONE_LABEL ?? "IST",
+    mutedPacks: list(process.env.ALERT_MUTE_PACKS),
+    alarmDebounceMs: int(process.env.ALERT_DEBOUNCE_S, 10) * 1000,
+    cellDebounceMs: int(process.env.ALERT_CELL_DEBOUNCE_S, 120) * 1000,
+    clearMs: int(process.env.ALERT_CLEAR_S, 60) * 1000,
+    offlineMs: int(process.env.ALERT_OFFLINE_MIN, 10) * 60_000,
+    systemDownMs: int(process.env.ALERT_SYSTEM_DOWN_MIN, 3) * 60_000,
+    spreadMv: int(process.env.ALERT_SPREAD_MV, 100),
+    cooldownMs: int(process.env.ALERT_COOLDOWN_MIN, 15) * 60_000,
+    // Safety net against a runaway loop: messages per rolling hour, all recipients.
+    maxPerHour: int(process.env.ALERT_MAX_PER_HOUR, 60),
+  },
   // Payloads bigger than this are someone else's traffic, not ours.
   maxPayloadBytes: 64 * 1024,
 };

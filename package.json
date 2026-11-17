@@ -10,6 +10,7 @@
     "lint": "tsc --noEmit",
     "ingest:dev": "node --env-file-if-exists=.env.local --watch ingest/main.ts",
     "ingest": "node --env-file-if-exists=.env.local ingest/main.ts",
+    "alert:test": "node --env-file-if-exists=.env.local ingest/main.ts --test-alert",
     "migrate": "node --env-file-if-exists=.env.local db/migrate-cli.ts",
     "build:ingest": "esbuild ingest/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/ingest.mjs --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
     "test": "node --test \"tests/**/*.test.ts\""

@@ -81,6 +81,7 @@ Other commands:
 |---|---|
 | `npm test` | Unit tests (payload parsing, time rules, row conversion) |
 | `npm run lint` | Type check everything |
+| `npm run alert:test` | Send one WhatsApp test message to `ALERT_RECIPIENTS` (needs the `WHATSAPP_*` settings in `.env.local`) |
 | `npm run migrate` | Apply database migrations without starting ingest (ingest also does it at startup) |
 | `npm run build:ingest` | Bundle ingest into `dist/ingest.mjs` (what the Docker image runs) |
 
@@ -155,6 +156,20 @@ payload unchanged (schema 2, see [Payload](#payload)).
 | `STALE_AFTER_S` | 60 | No message for this long = offline |
 | `CLOCK_TOLERANCE_S` | 300 | How close a synced device clock must be to arrival time to be used |
 | `DATABASE_URL` | `postgres://bms:bms_local@localhost:5433/bms` | Set by Compose inside Docker |
+| `ALERTS_ENABLED` | `false` | Send WhatsApp alerts. Off: alerts are only logged (see [WhatsApp alerts](#whatsapp-alerts)) |
+| `WHATSAPP_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID` | empty | Meta Cloud API credentials. Secret |
+| `WHATSAPP_TEMPLATE` / `WHATSAPP_TEMPLATE_LANG` | `battery_alert` / `en` | Approved template with 4 variables |
+| `WHATSAPP_API_VERSION` | `v26.0` | Graph API version |
+| `ALERT_RECIPIENTS` | empty | Numbers with country code, comma separated |
+| `ALERT_MUTE_PACKS` | empty | `device_id`s that never alert |
+| `ALERT_OFFLINE_MIN` | 10 | No reading this long = pack offline |
+| `ALERT_SPREAD_MV` | 100 | Cell spread alert threshold |
+| `ALERT_DEBOUNCE_S` / `ALERT_CELL_DEBOUNCE_S` | 10 / 120 | How long a BMS flag / cell check must hold before it alerts |
+| `ALERT_CLEAR_S` | 60 | How long an alert must be gone before "cleared" |
+| `ALERT_SYSTEM_DOWN_MIN` | 3 | MQTT or database down this long = alert |
+| `ALERT_COOLDOWN_MIN` | 15 | Same alert again within this time is not resent |
+| `ALERT_MAX_PER_HOUR` | 60 | Cap on messages per hour, all recipients together |
+| `ALERT_TIMEZONE` / `ALERT_TIMEZONE_LABEL` | `Asia/Kolkata` / `IST` | Times in messages |
 
 Restart ingest after editing `.env.local` (`docker compose up -d` or the
 `npm run ingest:dev` terminal).
@@ -167,6 +182,89 @@ update packs set enabled = false where device_id = 'EM_PACK_16S_03';
 ```
 
 Ingest re-reads the table every 30 s. A device page for this is in TODO.md.
+
+## WhatsApp alerts
+
+Ingest sends a WhatsApp message to everyone in `ALERT_RECIPIENTS` when:
+
+| Alert | Raised when | Cleared when |
+|---|---|---|
+| BMS alarm flag (over-current, over-discharge, over-charge, over-temperature, cell string error) | the flag is set for 10 s | it is off for 60 s |
+| Cell reading 0 V | a cell inside the string reads 0 V for 2 min (sense-lead fault) | gone for 2 min |
+| High cell imbalance | spread ≥ `ALERT_SPREAD_MV` (100 mV) for 2 min | below 80 % of that for 2 min |
+| Pack offline | no reading for `ALERT_OFFLINE_MIN` (10 min) | the next reading ("back online") |
+| MQTT broker unreachable | ingest disconnected for 3 min | connected for 60 s |
+| Database unreachable | writes failing, readings piling up in memory, for 3 min | writes succeed for 60 s |
+
+One message when an alert is raised and one when it clears, never one per
+reading. Alarms that start together on one pack share a message. An alert
+that comes back within 15 min of the last one it sent is not sent again
+(flapping). Alarms in readings replayed from the device's offline buffer are
+ignored. Raised alerts are kept in `alert_active`, so a restart or deploy
+neither repeats them nor loses the "cleared" message. Every alert, sent or
+not, is in `alert_log`:
+
+```sql
+select ts, pack, condition, kind, sent, error from alert_log order by ts desc limit 20;
+```
+
+Live state: `/api/status` → `ingest.alerts` (sent, failed, last error, what is raised now).
+
+Not covered: if the ingest container itself dies, or the whole droplet goes
+down, nothing is left to send the alert. An outside uptime check on the
+dashboard URL (UptimeRobot or similar) covers that.
+
+### One-time setup with Meta (WhatsApp Cloud API)
+
+1. **Business portfolio.** At business.facebook.com, create a business
+   portfolio for Exergi Murphy (or use the existing one). Business
+   verification is needed for higher sending limits; alerts to a handful of
+   numbers work before it.
+2. **App.** At developers.facebook.com: Create app → Business type → add the
+   **WhatsApp** product. This creates a WhatsApp Business Account and a free
+   test number (the test number can only message up to 5 numbers you add as
+   allowed recipients: fine for trying it out).
+3. **Sender number.** WhatsApp Manager → Phone numbers → add a number that is
+   not on the WhatsApp app (a new SIM, or a landline that can take the OTP
+   call). Set its display name, e.g. "EM Battery Monitor".
+4. **Template.** WhatsApp Manager → Message templates → Create:
+   category **Utility**, name `battery_alert`, language **English** (`en`),
+   body exactly:
+
+   ```
+   Battery monitor alert: {{1}}
+   Pack: {{2}}
+   Details: {{3}}
+   Time: {{4}}
+   Open the dashboard for live readings.
+   ```
+
+   Sample values for review: `Over-temperature` / `EM_PACK_57S_01` /
+   `182.4 V, -31.2 A, SOC 64%, max temp 48.3 C` / `14 Nov, 12:04 IST`.
+   Approval usually takes minutes to hours.
+5. **Permanent token.** Business settings → Users → System users → Add
+   (admin) → Assign assets: the app and the WhatsApp account, full control →
+   Generate token with `whatsapp_business_messaging` and
+   `whatsapp_business_management`, expiry **Never**. (The token on the app's
+   API setup page expires after 24 h: don't use it in production.)
+6. **Settings.** In `/opt/battery-iot/.env` on the droplet: `ALERTS_ENABLED=true`,
+   `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` (API setup page, *not* the
+   phone number itself), `ALERT_RECIPIENTS`. Then `docker compose up -d ingest`.
+7. **Test.**
+   `docker compose exec ingest node ingest.mjs --test-alert` sends one test
+   message to every recipient and prints Meta's answer for each.
+
+| Error in the log | Fix |
+|---|---|
+| `code 190` | Token expired or wrong: use the System User token from step 5 |
+| `code 132001` template not found | Name/language mismatch, or not approved yet |
+| `code 132000` | Template doesn't have exactly 4 variables |
+| `code 131030` | Test number: add the recipient under API setup → To |
+| `code 133010` | Sender number not registered with the Cloud API |
+
+Charges: Meta bills business-started messages per template category and
+country; utility messages to Indian numbers cost a fraction of a rupee
+each. See Meta's current pricing page.
 
 ## API
 
@@ -248,6 +346,9 @@ The dashboard's empty state names the cause. The usual ones:
 ingest/main.ts            MQTT subscriber, validation, /status endpoint
 ingest/writer.ts          batched inserts (once per second), buffer while the DB is down
 ingest/packs.ts           packs table as allowlist, cached
+ingest/alerts.ts          alert rules: when to raise and clear (pure, tested)
+ingest/notifier.ts        alerts -> WhatsApp queue, alert_active / alert_log
+ingest/whatsapp.ts        Meta WhatsApp Cloud API template sender
 db/migrations/*.sql       schema: hypertable, roll-ups, compression, retention
 db/migrate.ts             migration runner (ingest runs it at startup)
 lib/telemetry.ts          payload -> Reading, shared by ingest and web

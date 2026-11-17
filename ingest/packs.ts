@@ -49,6 +49,11 @@ export class PackRegistry {
     this.byDevice = new Map(rows.map((r) => [r.device_id, { id: r.id, enabled: r.enabled }]));
   }
 
+  /** device_ids of enabled packs (the alert engine watches these for silence). */
+  enabledDevices(): string[] {
+    return [...this.byDevice].filter(([, e]) => e.enabled).map(([d]) => d);
+  }
+
   get count() {
     return [...this.byDevice.values()].filter((e) => e.enabled).length;
   }
