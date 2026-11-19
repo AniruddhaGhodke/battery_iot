@@ -248,6 +248,7 @@ describe("Notifier", () => {
       return Promise.resolve([]);
     };
     sql.begin = async (fn: (tx: unknown) => Promise<unknown>) => fn(sql);
+    sql.json = (v: unknown) => ({ json: v });
     return { sql, queries };
   }
 
@@ -259,6 +260,7 @@ describe("Notifier", () => {
     timeZone: "Asia/Kolkata",
     timeZoneLabel: "IST",
     maxPerHour: 60,
+    diagnosisTimeoutMs: 5000,
   };
 
   it("sends one message per recipient, logs it and saves the active set", async () => {
@@ -303,5 +305,82 @@ describe("Notifier", () => {
     assert.equal(n.stats.failed, 1);
     assert.equal(n.stats.sent, 0);
     assert.match(n.stats.lastError ?? "", /91\*+0001: HTTP 400/);
+  });
+});
+
+describe("analysis in the message", () => {
+  const { Notifier: N } = { Notifier };
+
+  it("puts the cause line first in the details variable, and logs the report", async () => {
+    const { sql, queries } = (() => {
+      const queries: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const s: any = (strings: unknown) => {
+        if (!Array.isArray(strings) || !("raw" in strings)) return { helper: strings };
+        queries.push((strings as string[]).join("?").replace(/\s+/g, " ").trim());
+        return Promise.resolve([]);
+      };
+      s.begin = async (fn: (tx: unknown) => Promise<unknown>) => fn(s);
+      s.json = (v: unknown) => ({ json: v });
+      return { sql: s, queries };
+    })();
+
+    const sent: string[][] = [];
+    const sender = { send: async (_to: string, p: string[]) => (sent.push(p), "id") };
+    const diagnoseFn = async (condition: string, pack: string) => ({
+      condition,
+      summary: `Cell #7 sags under load on ${pack} — high internal resistance.`,
+      confidence: "likely" as const,
+      findings: [],
+      causes: ["c"],
+      actions: ["a"],
+      window: { from: T0, to: T0 + MIN, readings: 8600 },
+    });
+
+    const n = new N(
+      sql,
+      { ...OPTS, enabled: true, recipients: ["919000000001"], timeZone: "Asia/Kolkata", timeZoneLabel: "IST",
+        maxPerHour: 60, diagnosisTimeoutMs: 5000,
+        whatsapp: { token: "t", phoneNumberId: "1", template: "battery_alert", language: "en", apiVersion: "v26.0" } },
+      sender as unknown as WhatsAppSender,
+      diagnoseFn,
+    );
+    await n.start(T0);
+    for (let t = T0; t < T0 + MIN; t += 5 * S) n.observe(reading(t, { alarms: { over_discharge: true } }), t);
+    await n.idle();
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0][2], /^Cell #7 sags under load on P1 — high internal resistance\./);
+    assert.match(sent[0][2], /13\.2 V/, "the reading figures still follow the cause");
+    assert.ok(sent[0][2].length <= 400);
+    assert.equal(n.stats.analysed, 1);
+    assert.ok(queries.some((q) => q.startsWith("insert into alert_log")));
+  });
+
+  it("sends the alert anyway when the analysis times out", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const s: any = (strings: unknown) =>
+      Array.isArray(strings) && "raw" in strings ? Promise.resolve([]) : { helper: strings };
+    s.begin = async (fn: (tx: unknown) => Promise<unknown>) => fn(s);
+    s.json = (v: unknown) => ({ json: v });
+
+    const sent: string[][] = [];
+    const sender = { send: async (_to: string, p: string[]) => (sent.push(p), "id") };
+    const hang = () => new Promise<never>(() => {});
+    const n = new N(
+      s,
+      { ...OPTS, enabled: true, recipients: ["919000000001"], timeZone: "Asia/Kolkata", timeZoneLabel: "IST",
+        maxPerHour: 60, diagnosisTimeoutMs: 30,
+        whatsapp: { token: "t", phoneNumberId: "1", template: "battery_alert", language: "en", apiVersion: "v26.0" } },
+      sender as unknown as WhatsAppSender,
+      hang,
+    );
+    await n.start(T0);
+    for (let t = T0; t < T0 + MIN; t += 5 * S) n.observe(reading(t, { alarms: { over_discharge: true } }), t);
+    await n.idle();
+
+    assert.equal(sent.length, 1, "the alert still goes out");
+    assert.match(sent[0][2], /13\.2 V/);
+    assert.equal(n.stats.analysisFailed, 1);
   });
 });

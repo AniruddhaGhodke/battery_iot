@@ -70,6 +70,9 @@ export const config = {
     cooldownMs: int(process.env.ALERT_COOLDOWN_MIN, 15) * 60_000,
     // Safety net against a runaway loop: messages per rolling hour, all recipients.
     maxPerHour: int(process.env.ALERT_MAX_PER_HOUR, 60),
+    // The 24 h cause analysis runs before the message goes out; past this it
+    // is dropped and the alert is sent without it.
+    diagnosisTimeoutMs: int(process.env.ALERT_ANALYSIS_TIMEOUT_S, 8) * 1000,
   },
   // Payloads bigger than this are someone else's traffic, not ours.
   maxPayloadBytes: 64 * 1024,

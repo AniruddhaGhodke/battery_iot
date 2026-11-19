@@ -169,6 +169,7 @@ payload unchanged (schema 2, see [Payload](#payload)).
 | `ALERT_SYSTEM_DOWN_MIN` | 3 | MQTT or database down this long = alert |
 | `ALERT_COOLDOWN_MIN` | 15 | Same alert again within this time is not resent |
 | `ALERT_MAX_PER_HOUR` | 60 | Cap on messages per hour, all recipients together |
+| `ALERT_ANALYSIS_TIMEOUT_S` | 8 | Give up on the 24 h cause analysis after this and send the alert without it |
 | `ALERT_TIMEZONE` / `ALERT_TIMEZONE_LABEL` | `Asia/Kolkata` / `IST` | Times in messages |
 
 Restart ingest after editing `.env.local` (`docker compose up -d` or the
@@ -206,6 +207,43 @@ not, is in `alert_log`:
 
 ```sql
 select ts, pack, condition, kind, sent, error from alert_log order by ts desc limit 20;
+```
+
+### Cause analysis
+
+When a **battery** alert is raised — a BMS alarm flag, a silent cell or a
+widening spread — ingest reads that pack's last 24 h and works out what the
+data says about the cause before the message goes out. Offline and system
+alerts are not analysed.
+
+The one-line verdict goes into the WhatsApp message ahead of the readings;
+the full report lives on the dashboard at **/alerts** (linked from the header),
+with the figures it used, the ranked causes and what to check.
+
+What it separates, per condition:
+
+| Alert | The question it answers | How |
+|---|---|---|
+| Over-temperature | One hot spot, the duty cycle, or the ambient? | Compares temperature channels against their median, and peak temperature in the top vs bottom current quartile |
+| Over-charge | One weak cell or the charger setpoint? | Looks for a cell that tops out first, and whether the spread widens above 85 % SOC |
+| Over-discharge | Resistance or capacity? | A cell that sags only under load is resistance (or a bad joint); one that is low at rest is capacity |
+| Over-current | Inrush or a recurring load? | Counts separate episodes in 24 h and the peak in each direction |
+| Cell reading 0 V | Loose lead, broken lead, or dead channel? | Intermittent vs continuous zeros, and whether the affected positions are adjacent |
+| High imbalance | Resistance, capacity, or balancing? | Load-dependent vs SOC-dependent spread, and the trend against the previous 7 days |
+
+Every rule is deterministic — the same readings always give the same answer,
+and `lib/diagnose.ts` has no network calls or model in it. Where the data
+cannot separate two causes the report says `possible` or `unclear` rather
+than picking one. It is worked out from stored telemetry alone, so it points
+at what to check; it does not replace checking it.
+
+The analysis runs before the message is sent and is dropped after
+`ALERT_ANALYSIS_TIMEOUT_S` (8 s), because a late alert is worse than one with
+no explanation. Reports are kept in `alert_log.analysis` as JSON:
+
+```sql
+select ts, pack, condition, analysis -> 'summary' from alert_log
+where analysis is not null order by ts desc limit 10;
 ```
 
 Live state: `/api/status` → `ingest.alerts` (sent, failed, last error, what is raised now).
@@ -271,6 +309,8 @@ each. See Meta's current pricing page.
 | Route | Returns |
 |---|---|
 | `GET /api/status` | Ingest (broker link, message counters, rejections, write buffer), database health and size |
+| `GET /api/alerts?limit=&pack=` | Alert history with the cause analysis, plus what is raised right now |
+| `GET /api/alerts/:id` | One alert and its full report |
 | `GET /api/packs` | Every enabled pack that has sent data, with summary figures |
 | `GET /api/packs/:id` | Latest full reading for one pack |
 | `GET /api/packs/:id/recent?limit=360` | The last N raw readings, for the live charts |
@@ -347,6 +387,11 @@ ingest/main.ts            MQTT subscriber, validation, /status endpoint
 ingest/writer.ts          batched inserts (once per second), buffer while the DB is down
 ingest/packs.ts           packs table as allowlist, cached
 ingest/alerts.ts          alert rules: when to raise and clear (pure, tested)
+lib/diagnose.ts           24 h cause analysis: rules per condition (pure, tested)
+lib/condition-label.ts    human names for conditions, shared by ingest and web
+ingest/diagnose-data.ts   the SQL that gathers the 24 h window
+lib/alerts-data.ts        alert history queries for the dashboard
+app/alerts/               the alerts page and its full reports
 ingest/notifier.ts        alerts -> WhatsApp queue, alert_active / alert_log
 ingest/whatsapp.ts        Meta WhatsApp Cloud API template sender
 db/migrations/*.sql       schema: hypertable, roll-ups, compression, retention

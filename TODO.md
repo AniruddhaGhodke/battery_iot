@@ -56,9 +56,10 @@ Reference: `bms_iot/server/alerts.py`, thresholds in `bms_iot/config/alerts.yaml
 - [ ] Block-level stepping — see Hardware, balancing
 
 **Workflow**
-- [ ] Alerts page: open / acknowledged / closed, acknowledge with a name
-      (data is already in `alert_active` / `alert_log`)
-- [ ] Every alert carries a recommended action, not just a title
+- [ ] Alerts page: acknowledge / close with a name (the page at /alerts lists
+      raised and historical alerts with their cause analysis, but has no workflow yet)
+- [x] Every alert carries a recommended action, not just a title
+      (`lib/diagnose.ts`; shown on /alerts and summarised in the WhatsApp message)
 
 ## 4. Auth
 

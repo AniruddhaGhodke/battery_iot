@@ -159,7 +159,15 @@ export default function Dashboard() {
             <p className="text-xs text-ink-3">Live telemetry · refreshes every {POLL_MS / 1000} s</p>
           </div>
         </div>
-        <ConnectionBadge status={status} apiDown={apiDown} />
+        <div className="flex items-center gap-3">
+          <a
+            href="/alerts"
+            className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 transition hover:border-brand-light"
+          >
+            Alerts
+          </a>
+          <ConnectionBadge status={status} apiDown={apiDown} />
+        </div>
       </header>
 
       {/* Pack selector */}

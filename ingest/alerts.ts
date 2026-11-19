@@ -18,7 +18,9 @@
  *   system:db      the database refuses writes; readings pile up in memory
  */
 
-import { ALARM_KEYS, type Alarms, type Reading } from "../lib/telemetry.ts";
+import { ALARM_KEYS, type Reading } from "../lib/telemetry.ts";
+
+export { ALARM_LABELS, conditionLabel } from "../lib/condition-label.ts";
 
 export type AlertOptions = {
   /** A BMS flag must be set this long before it is raised. */
@@ -83,35 +85,6 @@ type State = {
   since: number;
   notified: boolean;
 };
-
-export const ALARM_LABELS: Record<keyof Alarms, string> = {
-  over_current: "Over-current",
-  over_discharge: "Over-discharge (low voltage)",
-  over_charge: "Over-charge (high voltage)",
-  over_temperature: "Over-temperature",
-  cell_string_error: "Cell string error",
-};
-
-export function conditionLabel(condition: string): string {
-  if (condition.startsWith("alarm:")) {
-    const k = condition.slice(6) as keyof Alarms;
-    return ALARM_LABELS[k] ?? k;
-  }
-  switch (condition) {
-    case "cell:silent":
-      return "Cell reading 0 V";
-    case "cell:spread":
-      return "High cell imbalance";
-    case "offline":
-      return "Pack offline";
-    case "system:mqtt":
-      return "MQTT broker unreachable";
-    case "system:db":
-      return "Database unreachable";
-    default:
-      return condition;
-  }
-}
 
 const fmt = (v: number | null, dp: number, unit: string) =>
   v === null ? null : `${v.toFixed(dp)}${unit}`;

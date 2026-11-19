@@ -10,6 +10,8 @@
  */
 
 import type { Sql } from "postgres";
+import { conditionLabel } from "../lib/condition-label.ts";
+import { type Diagnosis, isDiagnosable } from "../lib/diagnose.ts";
 import type { Reading } from "../lib/telemetry.ts";
 import type { AlertStatus } from "../lib/ingest-status.ts";
 import {
@@ -18,7 +20,6 @@ import {
   AlertEngine,
   type AlertOptions,
   clock,
-  conditionLabel,
   setAlertTimeZone,
   type SystemHealth,
 } from "./alerts.ts";
@@ -31,7 +32,12 @@ export type NotifierConfig = AlertOptions & {
   timeZone: string;
   timeZoneLabel: string;
   maxPerHour: number;
+  /** Give up on the 24 h cause analysis after this long and send without it. */
+  diagnosisTimeoutMs: number;
 };
+
+/** Runs the 24 h cause analysis for one raised alert. Injected, so it can be faked. */
+export type DiagnoseFn = (condition: string, packDeviceId: string) => Promise<Diagnosis | null>;
 
 /** One WhatsApp message: one or more events of the same pack and kind. */
 export type Message = {
@@ -47,14 +53,26 @@ export function whatsappConfigured(c: NotifierConfig): boolean {
   return Boolean(c.whatsapp.token && c.whatsapp.phoneNumberId && c.recipients.length);
 }
 
-/** Groups one batch of events into messages: per pack, raised and cleared apart. */
-export function toMessages(events: AlertEvent[], tzLabel: string): Message[] {
+/** One message per pack, with raised and cleared kept apart. */
+export function groupEvents(events: AlertEvent[]): AlertEvent[][] {
   const groups = new Map<string, AlertEvent[]>();
   for (const e of events) {
     const g = `${e.pack ?? ""}|${e.kind}|${e.notify}`;
     groups.set(g, [...(groups.get(g) ?? []), e]);
   }
-  return [...groups.values()].map((evs) => {
+  return [...groups.values()];
+}
+
+/**
+ * Builds the four template variables for one group. A cause line from the
+ * analysis goes first in the details, so it survives the length cap.
+ */
+export function buildMessage(
+  evs: AlertEvent[],
+  tzLabel: string,
+  diagnoses?: Map<string, Diagnosis>,
+): Message {
+  {
     const first = evs[0];
     const labels = evs.map((e) => conditionLabel(e.condition));
     let headline: string;
@@ -66,20 +84,31 @@ export function toMessages(events: AlertEvent[], tzLabel: string): Message[] {
     } else {
       headline = `✅ Cleared: ${labels.join(", ")}`;
     }
-    const details = [...new Set(evs.map((e) => e.detail).filter(Boolean))].join(" | ");
+    const causes = evs.map((e) => diagnoses?.get(e.key)?.summary).filter(Boolean) as string[];
+    const details = [...new Set([...causes, ...evs.map((e) => e.detail)].filter(Boolean))].join(" | ");
     const time = `${clock(first.at)}${tzLabel ? ` ${tzLabel}` : ""}`;
     return {
       pack: first.pack,
       events: evs,
       params: [headline, first.pack ?? "Monitoring server", details || "-", time],
     };
-  });
+  }
+}
+
+/** Groups and builds in one go. */
+export function toMessages(
+  events: AlertEvent[],
+  tzLabel: string,
+  diagnoses?: Map<string, Diagnosis>,
+): Message[] {
+  return groupEvents(events).map((evs) => buildMessage(evs, tzLabel, diagnoses));
 }
 
 export class Notifier {
   private sql: Sql;
   private cfg: NotifierConfig;
   private sender: WhatsAppSender | null;
+  private diagnoseFn: DiagnoseFn | null;
   private engine!: AlertEngine;
   private queue: Promise<void> = Promise.resolve();
   private sentTimes: number[] = [];
@@ -93,11 +122,14 @@ export class Notifier {
     suppressed: 0,
     lastSentAt: null,
     lastError: null,
+    analysed: 0,
+    analysisFailed: 0,
   };
 
-  constructor(sql: Sql, cfg: NotifierConfig, sender?: WhatsAppSender | null) {
+  constructor(sql: Sql, cfg: NotifierConfig, sender?: WhatsAppSender | null, diagnoseFn: DiagnoseFn | null = null) {
     this.sql = sql;
     this.cfg = cfg;
+    this.diagnoseFn = diagnoseFn;
     setAlertTimeZone(cfg.timeZone);
     const configured = whatsappConfigured(cfg);
     this.sender = sender !== undefined ? sender : configured ? new WhatsAppSender(cfg.whatsapp) : null;
@@ -148,18 +180,52 @@ export class Notifier {
 
   private handle(events: AlertEvent[]) {
     if (!events.length) return;
-    for (const m of toMessages(events, this.cfg.timeZoneLabel)) {
-      for (const e of m.events) {
+    for (const group of groupEvents(events)) {
+      for (const e of group) {
         console.log(`[alerts] ${e.kind.toUpperCase()} ${e.pack ?? "system"} ${e.condition}${e.notify ? "" : " (cooldown, not sent)"}: ${e.detail}`);
       }
-      this.queue = this.queue.then(() => this.deliver(m)).catch((e) => {
+      this.queue = this.queue.then(() => this.deliver(group)).catch((e) => {
         console.warn(`[alerts] ${(e as Error).message}`);
       });
     }
     void this.saveActive();
   }
 
-  private async deliver(m: Message) {
+  /**
+   * Cause analysis for the raised battery alerts in a group. Never throws and
+   * never blocks for long: on a timeout or error the alert goes out without it,
+   * because a late alert is worse than one with no explanation.
+   */
+  private async runDiagnoses(evs: AlertEvent[]): Promise<Map<string, Diagnosis>> {
+    const out = new Map<string, Diagnosis>();
+    if (!this.diagnoseFn) return out;
+    for (const e of evs) {
+      if (e.kind !== "raised" || e.pack === null || !isDiagnosable(e.condition)) continue;
+      try {
+        const d = await Promise.race([
+          this.diagnoseFn(e.condition, e.pack),
+          new Promise<null>((_, reject) =>
+            setTimeout(() => reject(new Error("analysis timed out")), this.cfg.diagnosisTimeoutMs),
+          ),
+        ]);
+        if (d) {
+          out.set(e.key, d);
+          this.stats.analysed++;
+        }
+      } catch (err) {
+        this.stats.analysisFailed++;
+        console.warn(`[alerts] analysis failed for ${e.pack} ${e.condition}: ${(err as Error).message}`);
+      }
+    }
+    return out;
+  }
+
+  private async deliver(group: AlertEvent[]) {
+    const notify = group[0].notify;
+    // Only worth the queries if the message is actually going out.
+    const diagnoses =
+      notify && this.cfg.enabled && this.sender ? await this.runDiagnoses(group) : new Map<string, Diagnosis>();
+    const m = buildMessage(group, this.cfg.timeZoneLabel, diagnoses);
     let sent = false;
     let error: string | null = null;
     const now = Date.now();
@@ -194,7 +260,7 @@ export class Notifier {
         console.warn(`[alerts] send failed: ${error}`);
       }
     }
-    await this.log(m, sent, error);
+    await this.log(m, sent, error, diagnoses);
   }
 
   private async sendWithRetry(to: string, params: string[]) {
@@ -209,7 +275,7 @@ export class Notifier {
     }
   }
 
-  private async log(m: Message, sent: boolean, error: string | null) {
+  private async log(m: Message, sent: boolean, error: string | null, diagnoses?: Map<string, Diagnosis>) {
     try {
       const rows = m.events.map((e) => ({
         ts: new Date(e.at),
@@ -220,6 +286,7 @@ export class Notifier {
         detail: e.detail,
         sent,
         error,
+        analysis: this.sql.json((diagnoses?.get(e.key) ?? null) as never),
       }));
       await this.sql`insert into alert_log ${this.sql(rows)}`;
     } catch (e) {

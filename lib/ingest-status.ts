@@ -58,6 +58,9 @@ export type AlertStatus = {
   suppressed: number;
   lastSentAt: number | null;
   lastError: string | null;
+  /** Alerts given a 24 h cause analysis, and analyses that failed or timed out. */
+  analysed: number;
+  analysisFailed: number;
   /** Alerts raised right now. pack null = system. */
   active: { pack: string | null; condition: string; since: number; notified: boolean }[];
 };

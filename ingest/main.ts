@@ -19,7 +19,9 @@ import { migrate } from "../db/migrate.ts";
 import type { IngestStatus } from "../lib/ingest-status.ts";
 import { parseReading, PayloadError, type Reading } from "../lib/telemetry.ts";
 import { config } from "./config.ts";
-import { Notifier, sendTestAlert } from "./notifier.ts";
+import { diagnose } from "../lib/diagnose.ts";
+import { gatherWindow } from "./diagnose-data.ts";
+import { type DiagnoseFn, Notifier, sendTestAlert } from "./notifier.ts";
 import { PackRegistry } from "./packs.ts";
 import { Writer } from "./writer.ts";
 
@@ -83,7 +85,15 @@ const writer = new Writer(sql, {
 });
 writer.start();
 
-const notifier = new Notifier(sql, config.alerts);
+/** 24 h cause analysis for a raised battery alert (lib/diagnose.ts). */
+const diagnoseAlert: DiagnoseFn = async (condition, deviceId) => {
+  const id = packs.lookup(deviceId);
+  if (typeof id !== "number") return null;
+  const window = await gatherWindow(sql, id, deviceId, condition, config.alerts.spreadMv);
+  return diagnose(condition, window);
+};
+
+const notifier = new Notifier(sql, config.alerts, undefined, diagnoseAlert);
 await notifier.start();
 const alertTimer = setInterval(() => {
   notifier.tick(packs.enabledDevices(), {
