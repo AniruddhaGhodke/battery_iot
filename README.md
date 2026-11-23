@@ -173,6 +173,9 @@ payload unchanged (schema 2, see [Payload](#payload)).
 | `CONFIG_SET_TOPIC` / `CONFIG_ACK_TOPIC` | `emspl/a7f3c2/{slug}/config/set` / `…/ack` | Topic templates; `{slug}` is the pack's own segment |
 | `CONFIG_ACK_TIMEOUT_S` | 20 | No acknowledgement within this and the request is given up on |
 | `CONFIG_RESTART_GRACE_S` | 120 | How long telemetry may take to return after an acknowledged restart |
+| `CONTROL_SET_TOPIC` / `CONTROL_ACK_TOPIC` | `emspl/a7f3c2/{slug}/control/set` / `…/ack` | Channel control topics, deliberately separate from configuration |
+| `CONTROL_EXPIRY_S` | 60 | A control command the firmware receives after this must be ignored |
+| `CONTROL_MAX_CURRENT_A` | 5 | The channel is not opened above this current |
 | `ALERT_TIMEZONE` / `ALERT_TIMEZONE_LABEL` | `Asia/Kolkata` / `IST` | Times in messages |
 
 Restart ingest after editing `.env.local` (`docker compose up -d` or the
@@ -374,6 +377,7 @@ listed so the values and limits can be agreed before firmware work starts, and
 | `bms_capacity_ah` | `0x03` | 1–10,000 Ah | commissioning |
 | `bms_series_count` | `0x04` | 1–192 | commissioning |
 | `bms_hall_sensor` | `0x19` | 1, 2 or 3 | commissioning |
+| `bms_power_on_default` | `0x0C` | on / off | commissioning |
 | `bms_precharge_delay_s` | `0x16` | 0–600 s | commissioning |
 
 ### For whoever writes the gateway firmware
@@ -403,12 +407,42 @@ telemetry payload. They are on the wire now and simply dropped. That gives
 read-back for nothing, which is how "applied" should really be confirmed, and
 lets the dashboard show the limits in force.
 
-**Not included here: channel control** (`0x07`) and the power-on default
-state (`0x0C`). Opening or closing the contactor is a control action, not a
-setting — it needs its own confirmation step, an interlock against switching
-under load, and a command expiry so a queued message cannot fire hours later
-when a pack reconnects. Worth building deliberately rather than as another row
-in this form.
+### Channel control
+
+Opening and closing the pack's channel is a control action, not a setting, and
+is handled separately (`lib/pack-control.ts`, the Channel control section on
+/settings). Like the setpoints it is **pending** until the gateway firmware
+forwards it.
+
+**The protocol has one channel command, not two.** `0x07` switches the channel
+as a whole; there is no separate charge-relay and discharge-relay command,
+even though the BMS reports the two MOS states separately (group 81, byte 8)
+and logs "damaged charging relay" and "damaged discharge relay" as distinct
+faults. Separate control would need the vendor to confirm an undocumented
+command or another bus.
+
+What makes it different from a setting:
+
+| | Why |
+|---|---|
+| Its own topic `.../control/set` and ACL entry | Permission to configure a pack and permission to open its contactor can be separated — remove two lines from the ACL to keep one without the other |
+| `expires_at` in the payload | The broker keeps queued messages for an offline device (persistence on, 14-day session expiry). **The firmware must ignore a command past its expiry** — otherwise a command sent and forgotten fires when the pack reconnects |
+| Interlock before publishing | The channel is not opened above `CONTROL_MAX_CURRENT_A` (5 A). Breaking a contactor under load arcs and can weld the contacts. Checked on the server against the pack's last reading, never in the browser |
+| Refuses on stale telemetry | Without a recent reading the pack's state is unknown, and switching blind is worse than not switching |
+| Confirmation in the dashboard | Neither button acts on a single click |
+
+The payload on `emspl/a7f3c2/<slug>/control/set`:
+
+```json
+{ "action": "channel", "value": "off", "request_id": 42, "expires_at": 1795435000000 }
+```
+
+Acknowledgements come back on `.../control/ack` in the same shape as a
+configuration ack.
+
+Set **`bms_power_on_default`** (`0x0C`) to match whatever you decide: a channel
+opened remotely closes again on the next power cycle unless that says
+otherwise. The two belong together.
 
 ### What the firmware must publish
 
@@ -594,6 +628,7 @@ ingest/notifier.ts        alerts -> WhatsApp queue, alert_active / alert_log
 ingest/whatsapp.ts        Meta WhatsApp Cloud API template sender
 ingest/commands.ts        remote configuration: publish, match acks, timeouts
 lib/pack-config.ts        what may be set and within what bounds (shared)
+lib/pack-control.ts       channel control: expiry, interlock, one command only
 lib/config-data.ts        configuration queries for the dashboard
 app/settings/             the settings page
 db/migrations/*.sql       schema: hypertable, roll-ups, compression, retention

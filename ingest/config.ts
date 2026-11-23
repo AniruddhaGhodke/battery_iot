@@ -52,6 +52,14 @@ export const config = {
     ackTimeoutMs: int(process.env.CONFIG_ACK_TIMEOUT_S, 20) * 1000,
     // After an acknowledged restart, how long telemetry may take to return.
     restartGraceMs: int(process.env.CONFIG_RESTART_GRACE_S, 120) * 1000,
+    // Switching the channel is a control action, not a setting: its own topic
+    // and its own ACL entry (lib/pack-control.ts).
+    controlSetTopic: process.env.CONTROL_SET_TOPIC || "emspl/a7f3c2/{slug}/control/set",
+    controlAckTopic: process.env.CONTROL_ACK_TOPIC || "emspl/a7f3c2/{slug}/control/ack",
+    // A control command the firmware receives after this is to be ignored.
+    controlExpiryMs: int(process.env.CONTROL_EXPIRY_S, 60) * 1000,
+    // Refuse to open the channel above this current.
+    controlMaxCurrentA: int(process.env.CONTROL_MAX_CURRENT_A, 5),
   },
 
   statusPort: int(process.env.STATUS_PORT, 3101),

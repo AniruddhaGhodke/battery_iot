@@ -16,10 +16,14 @@ export type ConfigurablePack = {
   online: boolean;
 };
 
+/** What a control request asked for, as stored in `requested`. */
+export type ControlRequested = { action: string; value: string };
+
 export type ConfigRequestRow = {
   id: number;
   deviceId: string;
-  requested: ConfigSettings;
+  kind: "config" | "control";
+  requested: ConfigSettings | ControlRequested;
   status: RequestStatus;
   requestedBy: string;
   requestedAt: number;
@@ -69,7 +73,8 @@ export async function listConfigRequests(limit = 20, deviceId?: string): Promise
     {
       id: string;
       deviceId: string;
-      requested: ConfigSettings;
+      kind: string;
+      requested: ConfigSettings | ControlRequested;
       status: string;
       requestedBy: string;
       requestedAt: Date;
@@ -81,6 +86,7 @@ export async function listConfigRequests(limit = 20, deviceId?: string): Promise
   >`
     select id,
            device_id    as "deviceId",
+           kind,
            requested,
            status,
            requested_by as "requestedBy",
@@ -96,6 +102,7 @@ export async function listConfigRequests(limit = 20, deviceId?: string): Promise
   return rows.map((r) => ({
     ...r,
     id: Number(r.id),
+    kind: r.kind === "control" ? "control" : "config",
     status: r.status as RequestStatus,
     requestedAt: r.requestedAt.getTime(),
     sentAt: r.sentAt?.getTime() ?? null,

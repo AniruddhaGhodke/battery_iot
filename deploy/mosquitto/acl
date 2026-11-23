@@ -8,6 +8,8 @@ user emspl-device
 topic write emspl/a7f3c2/+/data
 topic write emspl/a7f3c2/+/config/ack
 topic read emspl/a7f3c2/+/config/set
+topic write emspl/a7f3c2/+/control/ack
+topic read emspl/a7f3c2/+/control/set
 
 # The ingest worker: read telemetry and acknowledgements, and publish
 # configuration. It is the only client allowed to write config/set, which is
@@ -18,3 +20,8 @@ user bms-ingest
 topic read emspl/a7f3c2/+/data
 topic read emspl/a7f3c2/+/config/ack
 topic write emspl/a7f3c2/+/config/set
+# Switching the channel is kept on its own topic so that permission to
+# configure a pack and permission to open its contactor can be separated —
+# drop the next two lines to leave ingest able to configure but not switch.
+topic read emspl/a7f3c2/+/control/ack
+topic write emspl/a7f3c2/+/control/set

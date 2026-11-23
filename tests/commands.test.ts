@@ -8,6 +8,7 @@ import {
   subscriptionFor,
   topicFor,
 } from "../ingest/commands.ts";
+import { CONTROL_ACTIONS, interlockError, validateControl } from "../lib/pack-control.ts";
 import {
   CONFIG_FIELDS,
   fieldError,
@@ -22,6 +23,10 @@ const OPTS = {
   ackTopic: "emspl/a7f3c2/{slug}/config/ack",
   ackTimeoutMs: 20_000,
   restartGraceMs: 120_000,
+  controlSetTopic: "emspl/a7f3c2/{slug}/control/set",
+  controlAckTopic: "emspl/a7f3c2/{slug}/control/ack",
+  controlExpiryMs: 60_000,
+  controlMaxCurrentA: 5,
 };
 
 /** Records inserts and updates, and hands back incrementing ids. */
@@ -66,6 +71,7 @@ function manager(over: Partial<{ slug: string | null; fail: string }> = {}) {
     resolve: (deviceId) =>
       deviceId === "P1" ? { packId: 7, slug: over.slug === undefined ? "pack1" : over.slug } : null,
     expectSilence: (pack, until) => silences.push({ pack, until }),
+    latest: () => ({ currentA: 0, ageMs: 1000 }),
   });
   return { m, published, silences, log };
 }
@@ -343,6 +349,103 @@ describe("pending fields", () => {
         assert.ok(fieldError(f, f.min - 1) !== null, `${f.key} accepts below its minimum`);
         assert.ok(fieldError(f, f.max + 1) !== null, `${f.key} accepts above its maximum`);
       }
+    }
+  });
+});
+
+describe("channel control", () => {
+  it("has one channel command, not separate charge and discharge", () => {
+    // The 192S protocol reports both MOS states but offers only 0x07 to switch.
+    assert.equal(CONTROL_ACTIONS.length, 1);
+    assert.equal(CONTROL_ACTIONS[0].canCommand, "0x07");
+    assert.equal(CONTROL_ACTIONS[0].onValue, 1);
+    assert.equal(CONTROL_ACTIONS[0].offValue, 2);
+  });
+
+  it("refuses to switch until the firmware supports it", () => {
+    const v = validateControl("channel", "off");
+    assert.equal(v.ok, false);
+    assert.match(v.ok === false ? v.error : "", /does not forward this yet/);
+  });
+
+  it("rejects an unknown action or value", () => {
+    assert.equal(validateControl("explode", "on").ok, false);
+    assert.equal(validateControl("channel", "maybe").ok, false);
+  });
+
+  describe("interlock", () => {
+    const fresh = (currentA: number | null) => ({ currentA, ageMs: 1_000 });
+
+    it("will not open the channel under load", () => {
+      const e = interlockError("off", fresh(-42));
+      assert.match(e ?? "", /42\.0 A/);
+      assert.match(e ?? "", /arc and weld/);
+    });
+
+    it("allows opening at rest", () => {
+      assert.equal(interlockError("off", fresh(0.4)), null);
+      assert.equal(interlockError("off", fresh(-4.9)), null);
+    });
+
+    it("allows closing even under load, since an open channel carries nothing", () => {
+      assert.equal(interlockError("on", fresh(-80)), null);
+    });
+
+    it("will not switch blind on stale or missing telemetry", () => {
+      assert.match(interlockError("off", null) ?? "", /state is unknown/);
+      assert.match(interlockError("on", null) ?? "", /state is unknown/);
+      assert.match(interlockError("off", { currentA: 0, ageMs: 10 * 60_000 }) ?? "", /600 s old/);
+    });
+
+    it("will not open when the pack reports no current at all", () => {
+      assert.match(interlockError("off", fresh(null)) ?? "", /not reporting current/);
+    });
+  });
+
+  it("carries an expiry, so a queued command cannot fire late", async () => {
+    // The firmware must drop a command past expires_at; the broker keeps
+    // queued messages for an offline device for up to 14 days.
+    const { m, published } = manager();
+    // Reach past the pending flag the way enabling the field later will.
+    const spec = CONTROL_ACTIONS[0];
+    const wasPending = spec.pending;
+    (spec as { pending: boolean }).pending = false;
+    try {
+      const before = Date.now();
+      await m.submitControl("P1", "channel", "off", "admin");
+      await settled();
+      assert.equal(published.length, 1);
+      assert.equal(published[0].topic, "emspl/a7f3c2/pack1/control/set");
+      assert.equal(published[0].opts.retain, false);
+      const body = JSON.parse(published[0].payload);
+      assert.equal(body.action, "channel");
+      assert.equal(body.value, "off");
+      assert.ok(body.expires_at >= before + OPTS.controlExpiryMs);
+      assert.ok(body.request_id > 0);
+    } finally {
+      (spec as { pending: boolean }).pending = wasPending;
+    }
+  });
+
+  it("enforces the interlock on the server, not just in the browser", async () => {
+    const spec = CONTROL_ACTIONS[0];
+    const wasPending = spec.pending;
+    (spec as { pending: boolean }).pending = false;
+    try {
+      const published: { topic: string; payload: string; opts: { retain?: boolean } }[] = [];
+      const { sql } = fakeSql();
+      const m = new ConfigManager(sql, fakeClient(published), OPTS, {
+        resolve: () => ({ packId: 7, slug: "pack1" }),
+        expectSilence: () => {},
+        latest: () => ({ currentA: -60, ageMs: 500 }),
+      });
+      await assert.rejects(
+        () => m.submitControl("P1", "channel", "off", "admin"),
+        (e: ConfigError) => e.status === 409 && /arc and weld/.test(e.message),
+      );
+      assert.equal(published.length, 0, "nothing may be published when the interlock blocks");
+    } finally {
+      (spec as { pending: boolean }).pending = wasPending;
     }
   });
 });

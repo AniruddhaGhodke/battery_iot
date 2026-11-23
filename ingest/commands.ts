@@ -22,11 +22,20 @@ import {
   type RequestStatus,
   validateSettings,
 } from "../lib/pack-config.ts";
+import {
+  type ControlAction,
+  type ControlValue,
+  interlockError,
+  type LatestReading,
+  validateControl,
+} from "../lib/pack-control.ts";
 
 export type ConfigRequest = {
   id: number;
   deviceId: string;
   packId: number;
+  /** A setting change, or switching the channel. */
+  kind: "config" | "control";
   settings: ConfigSettings;
   status: RequestStatus;
   /** This setting restarts the device, so a silence is expected. */
@@ -46,6 +55,13 @@ export type CommandOptions = {
   ackTimeoutMs: number;
   /** After an acknowledged restart, how long telemetry may take to return. */
   restartGraceMs: number;
+  /** Templates for the control topics, kept apart from configuration. */
+  controlSetTopic: string;
+  controlAckTopic: string;
+  /** A control command the firmware receives after this must be ignored. */
+  controlExpiryMs: number;
+  /** Refuse to open the channel above this current. */
+  controlMaxCurrentA: number;
 };
 
 /** What the manager needs from the rest of ingest. */
@@ -54,6 +70,8 @@ export type CommandDeps = {
   resolve: (deviceId: string) => { packId: number; slug: string | null } | null;
   /** Tells the alert engine not to call this pack offline while it restarts. */
   expectSilence: (deviceId: string, untilMs: number) => void;
+  /** The pack's last reading, for the control interlock. */
+  latest: (deviceId: string) => LatestReading | null;
 };
 
 export class ConfigError extends Error {
@@ -183,6 +201,7 @@ export class ConfigManager {
       insert into config_requests ${this.sql({
         pack_id: target.packId,
         device_id: deviceId,
+        kind: "config",
         requested: this.sql.json(v.settings as never),
         status: "pending",
         requested_by: requestedBy,
@@ -194,6 +213,7 @@ export class ConfigManager {
       id,
       deviceId,
       packId: target.packId,
+      kind: "config",
       settings: v.settings,
       status: "pending",
       restarts: v.restarts,
@@ -214,6 +234,79 @@ export class ConfigManager {
       else void this.markSent(id);
     });
     console.log(`[config] #${id} ${deviceId} -> ${topic} ${JSON.stringify(v.settings)}`);
+    return req;
+  }
+
+  /**
+   * Switches the pack's channel. Separate from submit() because it carries an
+   * expiry, is checked against live telemetry first, and goes out on its own
+   * topic (lib/pack-control.ts).
+   */
+  async submitControl(
+    deviceId: string,
+    action: unknown,
+    value: unknown,
+    requestedBy: string,
+  ): Promise<ConfigRequest> {
+    const v = validateControl(action, value);
+    if (!v.ok) throw new ConfigError(v.error, 400);
+
+    const target = this.deps.resolve(deviceId);
+    if (!target) throw new ConfigError(`unknown or disabled pack: ${deviceId}`, 404);
+    if (!target.slug) {
+      throw new ConfigError(`no topic known for ${deviceId} yet`, 409);
+    }
+    for (const r of this.open.values()) {
+      if (r.deviceId === deviceId) {
+        throw new ConfigError(`request ${r.id} for ${deviceId} is still waiting for the device`, 409);
+      }
+    }
+
+    // Checked here, on the server, against what the pack last reported — not
+    // in the browser, which can be stale or bypassed.
+    const blocked = interlockError(v.value, this.deps.latest(deviceId), this.opts.controlMaxCurrentA);
+    if (blocked) throw new ConfigError(blocked, 409);
+
+    const now = Date.now();
+    const expiresAt = now + this.opts.controlExpiryMs;
+    const requested = { action: v.spec.action, value: v.value };
+    const rows = await this.sql<{ id: string }[]>`
+      insert into config_requests ${this.sql({
+        pack_id: target.packId,
+        device_id: deviceId,
+        kind: "control",
+        requested: this.sql.json(requested as never),
+        status: "pending",
+        requested_by: requestedBy,
+        requested_at: new Date(now),
+        expires_at: new Date(expiresAt),
+      })} returning id`;
+    const id = Number(rows[0].id);
+
+    const req: ConfigRequest = {
+      id,
+      deviceId,
+      packId: target.packId,
+      kind: "control",
+      settings: {},
+      status: "pending",
+      restarts: false,
+      requestedAt: now,
+      sentAt: null,
+      ackedAt: null,
+      ack: null,
+      error: null,
+    };
+    this.open.set(id, req);
+    this.stats.submitted++;
+
+    const topic = topicFor(this.opts.controlSetTopic, target.slug);
+    const payload = JSON.stringify({ ...requested, request_id: id, expires_at: expiresAt });
+    this.client.publish(topic, payload, { qos: 1, retain: false }, (err) => {
+      if (err) void this.finish(id, "failed", `publish failed: ${err.message}`);
+      else void this.markSent(id);
+    });
+    console.log(`[control] #${id} ${deviceId} -> ${topic} ${payload}`);
     return req;
   }
 
@@ -300,7 +393,9 @@ export class ConfigManager {
 
   private topicMatches(r: ConfigRequest, topic: string): boolean {
     const target = this.deps.resolve(r.deviceId);
-    return target?.slug ? topicFor(this.opts.ackTopic, target.slug) === topic : false;
+    if (!target?.slug) return false;
+    const template = r.kind === "control" ? this.opts.controlAckTopic : this.opts.ackTopic;
+    return topicFor(template, target.slug) === topic;
   }
 
   private async finish(id: number, status: RequestStatus, error?: string | null, ack?: unknown) {

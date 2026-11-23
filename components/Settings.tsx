@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ConfigRequestRow, ConfigurablePack } from "@/lib/config-data";
+import type { ConfigRequestRow, ConfigurablePack, ControlRequested } from "@/lib/config-data";
+import { CONTROL_ACTIONS, CONTROL_MAX_CURRENT_A } from "@/lib/pack-control";
 import {
   CONFIG_FIELDS,
   type ConfigKey,
@@ -48,8 +49,13 @@ function when(ms: number): string {
   }).format(ms);
 }
 
-function describe(s: ConfigSettings): string {
-  return Object.entries(s)
+function describe(r: ConfigRequestRow): string {
+  if (r.kind === "control") {
+    const c = r.requested as ControlRequested;
+    const spec = CONTROL_ACTIONS.find((x) => x.action === c.action);
+    return `${spec?.label ?? c.action} ${c.value}`;
+  }
+  return Object.entries(r.requested as ConfigSettings)
     .map(([k, v]) => {
       const f = FIELD_BY_KEY[k as ConfigKey];
       if (!f) return `${k} ${String(v)}`;
@@ -162,6 +168,8 @@ export function Settings({ initial }: { initial: Payload }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string[] | null>(null);
   const [watching, setWatching] = useState<number | null>(null);
+  // Which control action the user has confirmed. Nothing switches without it.
+  const [confirm] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pack = data.packs.find((p) => p.deviceId === device) ?? null;
@@ -379,6 +387,68 @@ export function Settings({ initial }: { initial: Payload }) {
         </p>
       </section>
 
+      <section className="rounded-xl border border-crit/30 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-semibold text-ink">Channel control</h2>
+        <p className="mt-1 text-xs text-ink-2">
+          Opening and closing the path the current flows through. Kept apart from the settings above
+          because it is a control action, not a configuration change: it has its own MQTT topic and
+          ACL entry, an expiry so a queued command cannot fire late, and an interlock.
+        </p>
+
+        {CONTROL_ACTIONS.map((c) => (
+          <div key={c.action} className="mt-3 rounded-lg border border-line/60 bg-surface-2/50 p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium text-ink-3">{c.label}</span>
+              <span className="rounded border border-line bg-white px-1.5 py-0.5 font-mono text-[10px] text-ink-3">
+                CAN {c.canCommand}
+              </span>
+              {c.pending && (
+                <span className="rounded border border-warn/40 bg-warn-bg px-1.5 py-0.5 text-[10px] font-medium text-warn">
+                  Awaiting firmware
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-ink-2">{c.help}</p>
+
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                type="button"
+                disabled
+                className="rounded-lg border border-line bg-white px-3 py-1.5 text-sm text-ink-3 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Close channel (on)
+              </button>
+              <button
+                type="button"
+                disabled
+                className="rounded-lg border border-crit/40 bg-white px-3 py-1.5 text-sm text-crit disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Open channel (off)
+              </button>
+              {confirm !== c.action ? (
+                <span className="text-xs text-ink-3">Confirmation is required before either acts.</span>
+              ) : null}
+            </div>
+          </div>
+        ))}
+
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-xs text-ink-2 marker:text-ink-3">
+          <li>
+            The channel is not opened while the pack is carrying more than {CONTROL_MAX_CURRENT_A} A
+            — breaking a contactor under load arcs and can weld the contacts. Checked on the server
+            against the pack&apos;s last reading, not in this page.
+          </li>
+          <li>
+            Nothing is switched if telemetry is stale: without a current reading the pack&apos;s state
+            is unknown, and switching blind is worse than not switching.
+          </li>
+          <li>
+            Set <span className="font-medium">Channel state after power-on</span> above to match. A
+            channel opened remotely closes again on the next power cycle unless that says otherwise.
+          </li>
+        </ul>
+      </section>
+
       <section>
         <h2 className="text-sm font-semibold text-ink">Recent requests</h2>
         {data.requests.length === 0 ? (
@@ -391,7 +461,7 @@ export function Settings({ initial }: { initial: Payload }) {
               <li key={r.id} className="rounded-xl border border-line bg-white p-3 shadow-sm">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <span className="text-sm font-medium text-ink">
-                    {r.deviceId} · {describe(r.requested)}
+                    {r.deviceId} · {describe(r)}
                   </span>
                   <span className="flex items-center gap-2">
                     <Chip status={r.status} />

@@ -115,15 +115,27 @@ const alertTimer = setInterval(() => {
 // emspl/a7f3c2/+/data. Used to learn which topic each device publishes on.
 const SLUG_INDEX = config.mqttTopic.split("/").indexOf("+");
 const ACK_SUBSCRIPTION = subscriptionFor(config.remoteConfig.ackTopic);
-const ACK_PREFIX = config.remoteConfig.ackTopic.split("{slug}")[0];
-const ACK_SUFFIX = config.remoteConfig.ackTopic.split("{slug}").at(-1) ?? "";
+const CONTROL_ACK_SUBSCRIPTION = subscriptionFor(config.remoteConfig.controlAckTopic);
+
+/** Does this topic match a "prefix{slug}suffix" template? */
+function matchesTemplate(template: string, topic: string): boolean {
+  const [prefix, suffix = ""] = template.split("{slug}");
+  return topic.startsWith(prefix) && topic.endsWith(suffix) && topic.length > prefix.length + suffix.length;
+}
 
 /** An acknowledgement topic rather than telemetry. */
 function isAckTopic(topic: string): boolean {
-  return topic.startsWith(ACK_PREFIX) && topic.endsWith(ACK_SUFFIX) && topic !== ACK_PREFIX;
+  return (
+    matchesTemplate(config.remoteConfig.ackTopic, topic) ||
+    matchesTemplate(config.remoteConfig.controlAckTopic, topic)
+  );
 }
 
 let configs: ConfigManager | undefined;
+
+// The pack's last reported current, for the control interlock: the channel is
+// not opened while the pack is carrying load (lib/pack-control.ts).
+const lastReading = new Map<string, { currentA: number | null; at: number }>();
 
 // Last arrival-time ts per pack. When the broker delivers a queued backlog
 // (after an ingest restart) many messages arrive in the same millisecond;
@@ -155,6 +167,7 @@ function store(packId: number | null, reading: Reading) {
   writer.push(packId, reading);
   msgStats.accepted++;
   notifier.observe(reading);
+  lastReading.set(reading.packId, { currentA: reading.current, at: Date.now() });
   if (SLUG_INDEX >= 0) {
     const slug = reading.topic.split("/")[SLUG_INDEX];
     if (slug) packs.noteTopic(reading.packId, slug);
@@ -226,7 +239,7 @@ client.on("connect", (ack) => {
   mqttStats.lastError = null;
   // With a resumed session the broker remembers the subscription, but
   // subscribing again is harmless and covers a changed MQTT_TOPIC.
-  client.subscribe([config.mqttTopic, ACK_SUBSCRIPTION], { qos: 1 }, (err, granted) => {
+  client.subscribe([config.mqttTopic, ACK_SUBSCRIPTION, CONTROL_ACK_SUBSCRIPTION], { qos: 1 }, (err, granted) => {
     if (err) mqttStats.lastError = `subscribe failed: ${err.message}`;
     else {
       const refused = granted?.filter((g) => g.qos === 128).map((g) => g.topic) ?? [];
@@ -238,7 +251,7 @@ client.on("connect", (ack) => {
   });
   console.log(
     `[mqtt] connected to ${config.mqttUrl} as ${config.mqttClientId}` +
-      `${ack.sessionPresent ? " (resumed session)" : ""}, subscribed to ${config.mqttTopic} and ${ACK_SUBSCRIPTION}`,
+      `${ack.sessionPresent ? " (resumed session)" : ""}, subscribed to ${config.mqttTopic}, ${ACK_SUBSCRIPTION} and ${CONTROL_ACK_SUBSCRIPTION}`,
   );
 });
 client.on("close", () => {
@@ -253,6 +266,10 @@ client.on("error", (err) => {
 configs = new ConfigManager(sql, client, config.remoteConfig, {
   resolve: (deviceId) => packs.resolve(deviceId),
   expectSilence: (deviceId, until) => notifier.expectSilence(deviceId, until),
+  latest: (deviceId) => {
+    const r = lastReading.get(deviceId);
+    return r ? { currentA: r.currentA, ageMs: Date.now() - r.at } : null;
+  },
 });
 await configs.start();
 
@@ -349,8 +366,31 @@ async function postConfig(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 }
 
+/** POST /control — switching the channel. Same route in, different guards. */
+async function postControl(req: http.IncomingMessage, res: http.ServerResponse) {
+  try {
+    const body = (await readJson(req)) as Record<string, unknown>;
+    const deviceId = typeof body.device_id === "string" ? body.device_id.trim() : "";
+    if (!deviceId) throw new ConfigError("device_id is required", 400);
+    if (!configs) throw new ConfigError("ingest is still starting up", 503);
+    const by = typeof body.requested_by === "string" && body.requested_by.trim()
+      ? body.requested_by.trim().slice(0, 100)
+      : "unknown";
+    const r = await configs.submitControl(deviceId, body.action, body.value, by);
+    json(res, 202, { id: r.id, device_id: r.deviceId, status: r.status, kind: r.kind });
+  } catch (e) {
+    if (e instanceof ConfigError) json(res, e.status, { error: e.message, details: e.details });
+    else {
+      console.warn(`[control] request failed: ${(e as Error).message}`);
+      json(res, 500, { error: (e as Error).message });
+    }
+  }
+}
+
 const server = http.createServer((req, res) => {
-  if (req.method === "POST" && req.url === "/config") {
+  if (req.method === "POST" && req.url === "/control") {
+    void postControl(req, res);
+  } else if (req.method === "POST" && req.url === "/config") {
     void postConfig(req, res);
   } else if (req.url === "/health") {
     res.writeHead(200, { "content-type": "text/plain" }).end("ok");

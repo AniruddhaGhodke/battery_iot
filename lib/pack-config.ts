@@ -50,7 +50,8 @@ export type ConfigKey =
   | "bms_capacity_ah"
   | "bms_series_count"
   | "bms_hall_sensor"
-  | "bms_precharge_delay_s";
+  | "bms_precharge_delay_s"
+  | "bms_power_on_default";
 
 export type FieldGroup = "gateway" | "protection" | "balancing" | "thermal" | "commissioning";
 
@@ -382,6 +383,20 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     group: "commissioning",
     target: "bms",
     canCommand: "0x19",
+    restarts: false,
+    pending: true,
+  },
+  {
+    key: "bms_power_on_default",
+    kind: "bool",
+    onValue: 1,
+    offValue: 2,
+    label: "Channel state after power-on",
+    unit: "",
+    help: "What the channel does when the BMS powers up. Decide this together with channel control: switching the channel off remotely means nothing if a power cycle closes it again.",
+    group: "commissioning",
+    target: "bms",
+    canCommand: "0x0C",
     restarts: false,
     pending: true,
   },
