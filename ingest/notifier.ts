@@ -158,6 +158,11 @@ export class Notifier {
     console.log(`[alerts] WhatsApp ${mode}; ${restored.length} alert(s) restored`);
   }
 
+  /** See AlertEngine.expectSilence. */
+  expectSilence(pack: string, untilMs: number) {
+    if (this.engine) this.engine.expectSilence(pack, untilMs);
+  }
+
   active(): AlertStatus["active"] {
     return this.engine ? this.engine.active() : [];
   }

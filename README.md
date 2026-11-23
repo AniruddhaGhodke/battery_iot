@@ -170,6 +170,9 @@ payload unchanged (schema 2, see [Payload](#payload)).
 | `ALERT_COOLDOWN_MIN` | 15 | Same alert again within this time is not resent |
 | `ALERT_MAX_PER_HOUR` | 60 | Cap on messages per hour, all recipients together |
 | `ALERT_ANALYSIS_TIMEOUT_S` | 8 | Give up on the 24 h cause analysis after this and send the alert without it |
+| `CONFIG_SET_TOPIC` / `CONFIG_ACK_TOPIC` | `emspl/a7f3c2/{slug}/config/set` / `…/ack` | Topic templates; `{slug}` is the pack's own segment |
+| `CONFIG_ACK_TIMEOUT_S` | 20 | No acknowledgement within this and the request is given up on |
+| `CONFIG_RESTART_GRACE_S` | 120 | How long telemetry may take to return after an acknowledged restart |
 | `ALERT_TIMEZONE` / `ALERT_TIMEZONE_LABEL` | `Asia/Kolkata` / `IST` | Times in messages |
 
 Restart ingest after editing `.env.local` (`docker compose up -d` or the
@@ -304,6 +307,139 @@ Charges: Meta bills business-started messages per template category and
 country; utility messages to Indian numbers cost a fraction of a rupee
 each. See Meta's current pricing page.
 
+## Remote configuration
+
+The dashboard can send supported settings to a pack and show what the pack
+answers. **/settings** (linked from the header) selects a device, sends only
+the settings you tick, and tracks the result.
+
+Ingest is the only process with broker credentials, so the browser never
+holds them:
+
+```
+browser ──► /api/config (web) ──HTTP──► ingest ──MQTT──► emspl/a7f3c2/<slug>/config/set
+                                           ◄──MQTT───── emspl/a7f3c2/<slug>/config/ack
+```
+
+| Purpose | Topic |
+|---|---|
+| Configuration command (ingest publishes) | `emspl/a7f3c2/<slug>/config/set` |
+| Acknowledgement (device publishes) | `emspl/a7f3c2/<slug>/config/ack` |
+| Telemetry (existing) | `emspl/a7f3c2/<slug>/data` |
+
+`<slug>` is the pack's own topic segment. It is **learned from the telemetry
+topic**, not configured by hand: the first reading from a pack records it in
+`packs.topic_slug`. A pack that has never published cannot be configured, and
+the settings page says so.
+
+### Settings
+
+Only what the firmware supports today, defined once in `lib/pack-config.ts`
+so the form and the server agree:
+
+| Key | Values | Restarts the device |
+|---|---|---|
+| `can_baud_kbps` | 250 or 500 | yes |
+| `telemetry_interval_ms` | 1,000–300,000 | no |
+
+Unknown keys are rejected rather than forwarded — a device that receives a key
+it does not understand may ignore the whole message. The browser is not
+trusted: ingest validates every request again.
+
+**On the bitrate:** the 192S BMS protocol runs at 250 kbps and has no bitrate
+command of its own, so setting 500 will stop the pack reading its BMS. The
+pack itself stays reachable over WiFi, so it can be set back.
+
+### What the firmware must publish
+
+There is no acknowledgement frame in the configuration payload spec, so this
+is the contract. On `emspl/a7f3c2/<slug>/config/ack`:
+
+```json
+{
+  "device_id": "EM_PACK_57S_01",
+  "request_id": 42,
+  "status": "accepted",
+  "applied": { "telemetry_interval_ms": 30000 },
+  "error": null
+}
+```
+
+- `status` is `accepted` or `rejected`. `result`/`state` and a boolean
+  `ok`/`accepted`/`success` are accepted too.
+- `error` is shown to the user verbatim on a rejection — make it specific.
+- **`request_id` is not sent today** (the payload spec has no field for it, so
+  ingest does not add one). Without it an acknowledgement is matched to the
+  oldest outstanding request for that device, which is ambiguous with two in
+  flight. Ingest only allows one open request per pack because of this. Echoing
+  a `request_id` back is a small firmware change that removes the limitation.
+
+### Status
+
+| Status | Meaning |
+|---|---|
+| `pending` | Accepted by the server, not yet published |
+| `sent` | The broker accepted the publish — **not** proof the device applied it |
+| `restarting` | Acknowledged; waiting for the pack to come back |
+| `applied` | Acknowledged, and for a restart telemetry has resumed |
+| `rejected` | The device refused it, with its reason |
+| `timeout` | No acknowledgement, or it never came back after a restart |
+| `failed` | The publish itself did not get through (usually the ACL) |
+
+History is in `config_requests`:
+
+```sql
+select id, device_id, requested, status, requested_by, error
+  from config_requests order by requested_at desc limit 10;
+```
+
+Commands are published at **QoS 1 with retain off**. A retained configuration
+would be redelivered and reapplied every time a device reconnected.
+
+### Broker access
+
+`deploy/mosquitto/acl` grants `bms-ingest` write on `+/config/set` and read on
+`+/config/ack`, and the device account the mirror of that. Ingest is the only
+client permitted to write `config/set`, which is what stops anything else
+reconfiguring a pack. After changing the ACL:
+
+```bash
+docker compose restart mosquitto
+```
+
+A `failed` request with "not authorized", or `broker refused subscription` in
+the ingest log, means the ACL was not picked up.
+
+### Testing it
+
+```bash
+# from the droplet, pretending to be a pack
+docker compose exec mosquitto mosquitto_sub -u bms-ingest -P "$MQTT_PASSWORD" \
+  -t 'emspl/a7f3c2/+/config/set' -v
+```
+
+Send a change from /settings and the payload appears. To answer it:
+
+```bash
+docker compose exec mosquitto mosquitto_pub -u emspl-device -P '<device password>' \
+  -t 'emspl/a7f3c2/pack1/config/ack' \
+  -m '{"device_id":"EM_PACK_57S_01","status":"accepted"}'
+```
+
+The page moves to Applied within a couple of seconds.
+
+### Not included
+
+- **TLS.** The broker listens on plain 1883. Worth adding before configuration
+  commands travel over untrusted networks.
+- **Per-user identity.** `requested_by` comes from the basic-auth username in
+  front of the dashboard, so today every row says `admin`. Real attribution
+  needs app logins (TODO 3).
+- **BMS setpoints and channel control.** The 192S protocol does accept these
+  (`0x01`/`0x02`/`0x05`/`0x06` and `0x07` on CAN id `0xF4`), but the gateway
+  firmware does not expose them over MQTT yet. `lib/pack-config.ts` is where
+  they are added once it does.
+
 ## API
 
 | Route | Returns |
@@ -311,6 +447,8 @@ each. See Meta's current pricing page.
 | `GET /api/status` | Ingest (broker link, message counters, rejections, write buffer), database health and size |
 | `GET /api/alerts?limit=&pack=` | Alert history with the cause analysis, plus what is raised right now |
 | `GET /api/alerts/:id` | One alert and its full report |
+| `GET /api/config` | Configurable packs and the recent request history |
+| `POST /api/config` | Send settings to a pack (proxied to ingest, which owns the broker connection) |
 | `GET /api/packs` | Every enabled pack that has sent data, with summary figures |
 | `GET /api/packs/:id` | Latest full reading for one pack |
 | `GET /api/packs/:id/recent?limit=360` | The last N raw readings, for the live charts |
@@ -394,6 +532,10 @@ lib/alerts-data.ts        alert history queries for the dashboard
 app/alerts/               the alerts page and its full reports
 ingest/notifier.ts        alerts -> WhatsApp queue, alert_active / alert_log
 ingest/whatsapp.ts        Meta WhatsApp Cloud API template sender
+ingest/commands.ts        remote configuration: publish, match acks, timeouts
+lib/pack-config.ts        what may be set and within what bounds (shared)
+lib/config-data.ts        configuration queries for the dashboard
+app/settings/             the settings page
 db/migrations/*.sql       schema: hypertable, roll-ups, compression, retention
 db/migrate.ts             migration runner (ingest runs it at startup)
 lib/telemetry.ts          payload -> Reading, shared by ingest and web

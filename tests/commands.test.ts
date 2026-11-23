@@ -1,0 +1,286 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import type { MqttClient } from "mqtt";
+import {
+  ConfigError,
+  ConfigManager,
+  parseAck,
+  subscriptionFor,
+  topicFor,
+} from "../ingest/commands.ts";
+import { fieldError, FIELD_BY_KEY, staleAfterMs, validateSettings } from "../lib/pack-config.ts";
+
+const OPTS = {
+  setTopic: "emspl/a7f3c2/{slug}/config/set",
+  ackTopic: "emspl/a7f3c2/{slug}/config/ack",
+  ackTimeoutMs: 20_000,
+  restartGraceMs: 120_000,
+};
+
+/** Records inserts and updates, and hands back incrementing ids. */
+function fakeSql() {
+  const log: { text: string; values: unknown[] }[] = [];
+  let nextId = 1;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sql: any = (strings: unknown, ...values: unknown[]) => {
+    if (!Array.isArray(strings) || !("raw" in strings)) return { helper: strings };
+    const text = (strings as string[]).join("?").replace(/\s+/g, " ").trim();
+    log.push({ text, values });
+    if (text.startsWith("insert into config_requests")) {
+      return Promise.resolve([{ id: String(nextId++) }]);
+    }
+    return Promise.resolve([]);
+  };
+  sql.json = (v: unknown) => ({ json: v });
+  return { sql, log };
+}
+
+type Published = { topic: string; payload: string; opts: { qos?: number; retain?: boolean } };
+
+function fakeClient(published: Published[], fail?: string) {
+  return {
+    publish: (
+      topic: string,
+      payload: string,
+      opts: { qos?: number; retain?: boolean },
+      cb: (e?: Error) => void,
+    ) => {
+      published.push({ topic, payload, opts });
+      cb(fail ? new Error(fail) : undefined);
+    },
+  } as unknown as MqttClient;
+}
+
+function manager(over: Partial<{ slug: string | null; fail: string }> = {}) {
+  const published: Published[] = [];
+  const silences: { pack: string; until: number }[] = [];
+  const { sql, log } = fakeSql();
+  const m = new ConfigManager(sql, fakeClient(published, over.fail), OPTS, {
+    resolve: (deviceId) =>
+      deviceId === "P1" ? { packId: 7, slug: over.slug === undefined ? "pack1" : over.slug } : null,
+    expectSilence: (pack, until) => silences.push({ pack, until }),
+  });
+  return { m, published, silences, log };
+}
+
+const settled = () => new Promise((r) => setImmediate(r));
+
+describe("topics", () => {
+  it("fills the slug and builds a subscription", () => {
+    assert.equal(topicFor(OPTS.setTopic, "pack1"), "emspl/a7f3c2/pack1/config/set");
+    assert.equal(subscriptionFor(OPTS.ackTopic), "emspl/a7f3c2/+/config/ack");
+  });
+});
+
+describe("validation", () => {
+  it("accepts the supported values", () => {
+    const v = validateSettings({ can_baud_kbps: 250, telemetry_interval_ms: 5000 });
+    assert.ok(v.ok);
+    assert.deepEqual(v.settings, { can_baud_kbps: 250, telemetry_interval_ms: 5000 });
+    assert.equal(v.restarts, true, "a bitrate change restarts the device");
+  });
+
+  it("rejects out-of-range, non-integer and unknown fields", () => {
+    for (const bad of [
+      { can_baud_kbps: 1000 },
+      { telemetry_interval_ms: 999 },
+      { telemetry_interval_ms: 300_001 },
+      { telemetry_interval_ms: 1500.5 },
+      { wifi_password: "hunter2" },
+      {},
+      "nope",
+    ]) {
+      assert.equal(validateSettings(bad).ok, false, JSON.stringify(bad));
+    }
+  });
+
+  it("knows which settings restart the device", () => {
+    const v = validateSettings({ telemetry_interval_ms: 10_000 });
+    assert.ok(v.ok);
+    assert.equal(v.restarts, false);
+  });
+
+  it("reports the bound in the message, so the UI can show it", () => {
+    const e = fieldError(FIELD_BY_KEY.telemetry_interval_ms, 500);
+    // en-IN groups in lakhs, which is what an Indian user expects to read.
+    assert.match(e ?? "", /1,000–3,00,000 ms/);
+  });
+});
+
+describe("staleAfterMs", () => {
+  it("never shrinks below the default but follows a long interval", () => {
+    assert.equal(staleAfterMs(null, 60_000), 60_000);
+    assert.equal(staleAfterMs(5_000, 60_000), 60_000);
+    assert.equal(staleAfterMs(300_000, 60_000), 900_000);
+  });
+});
+
+describe("parseAck", () => {
+  it("reads the documented shape", () => {
+    const a = parseAck({ device_id: "P1", request_id: 4, status: "accepted" });
+    assert.deepEqual(a, { deviceId: "P1", requestId: 4, accepted: true, error: null });
+  });
+
+  it("accepts the obvious variants and a string request id", () => {
+    assert.equal(parseAck({ result: "rejected", reason: "bad value" }).accepted, false);
+    assert.equal(parseAck({ ok: true }).accepted, true);
+    assert.equal(parseAck({ accepted: false }).accepted, false);
+    assert.equal(parseAck({ request_id: "12" }).requestId, 12);
+    assert.equal(parseAck({ status: "rejected", error: "out of range" }).error, "out of range");
+  });
+
+  it("says nothing rather than guessing when the device does not report a result", () => {
+    assert.equal(parseAck({ device_id: "P1" }).accepted, null);
+    assert.equal(parseAck("junk").deviceId, null);
+  });
+});
+
+describe("submit", () => {
+  it("publishes at QoS 1 without retain, and records the request", async () => {
+    const { m, published, log } = manager();
+    const r = await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+
+    assert.equal(published.length, 1);
+    assert.equal(published[0].topic, "emspl/a7f3c2/pack1/config/set");
+    assert.deepEqual(JSON.parse(published[0].payload), { telemetry_interval_ms: 10_000 });
+    assert.equal(published[0].opts.qos, 1);
+    assert.equal(published[0].opts.retain, false, "a retained command would be reapplied on reconnect");
+    assert.equal(r.id, 1);
+    assert.equal(m.openRequests()[0].status, "sent");
+    assert.ok(log.some((q) => q.text.startsWith("insert into config_requests")));
+  });
+
+  it("refuses a pack it cannot address", async () => {
+    await assert.rejects(
+      () => manager().m.submit("NOPE", { telemetry_interval_ms: 5000 }, "admin"),
+      (e: ConfigError) => e.status === 404,
+    );
+    await assert.rejects(
+      () => manager({ slug: null }).m.submit("P1", { telemetry_interval_ms: 5000 }, "admin"),
+      (e: ConfigError) => e.status === 409 && /no topic known/.test(e.message),
+    );
+  });
+
+  it("reports validation errors without publishing", async () => {
+    const { m, published } = manager();
+    await assert.rejects(
+      () => m.submit("P1", { telemetry_interval_ms: 10 }, "admin"),
+      (e: ConfigError) => e.status === 400 && e.details.length === 1,
+    );
+    assert.equal(published.length, 0);
+  });
+
+  it("will not queue a second request for a pack that has not answered", async () => {
+    const { m } = manager();
+    await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    await assert.rejects(
+      () => m.submit("P1", { telemetry_interval_ms: 20_000 }, "admin"),
+      (e: ConfigError) => e.status === 409,
+    );
+  });
+
+  it("marks the request failed when the publish does not get through", async () => {
+    const { m } = manager({ fail: "not authorized" });
+    await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    assert.equal(m.openRequests().length, 0);
+    assert.equal(m.stats.failed, 1);
+  });
+});
+
+describe("acknowledgement", () => {
+  it("applies a non-restarting setting straight away", async () => {
+    const { m } = manager();
+    const r = await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { device_id: "P1", request_id: r.id, status: "accepted" });
+    await settled();
+    assert.equal(m.stats.applied, 1);
+    assert.equal(m.openRequests().length, 0);
+  });
+
+  it("waits for telemetry after a restart, and tells the alert engine to expect the gap", async () => {
+    const { m, silences } = manager();
+    const r = await m.submit("P1", { can_baud_kbps: 250 }, "admin");
+    await settled();
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { device_id: "P1", request_id: r.id, status: "accepted" });
+    await settled();
+
+    assert.equal(m.openRequests()[0].status, "restarting");
+    assert.equal(m.stats.applied, 0, "not applied until the pack is back");
+    assert.equal(silences.length, 1, "the offline alert must be suppressed meanwhile");
+    assert.equal(silences[0].pack, "P1");
+
+    m.onTelemetry("P1");
+    await settled();
+    assert.equal(m.stats.applied, 1);
+    assert.equal(m.openRequests().length, 0);
+  });
+
+  it("records a rejection with the device's reason", async () => {
+    const { m } = manager();
+    const r = await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", {
+      device_id: "P1",
+      request_id: r.id,
+      status: "rejected",
+      error: "interval out of range",
+    });
+    await settled();
+    assert.equal(m.stats.rejected, 1);
+  });
+
+  it("matches on the device when the firmware sends no request id", async () => {
+    const { m } = manager();
+    await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { device_id: "P1", status: "accepted" });
+    await settled();
+    assert.equal(m.stats.applied, 1);
+  });
+
+  it("falls back to the topic when the payload names no device either", async () => {
+    const { m } = manager();
+    await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { status: "accepted" });
+    await settled();
+    assert.equal(m.stats.applied, 1);
+  });
+
+  it("ignores an acknowledgement it cannot place", async () => {
+    const { m } = manager();
+    m.handleAck("emspl/a7f3c2/pack9/config/ack", { device_id: "OTHER", status: "accepted" });
+    await settled();
+    assert.equal(m.stats.applied, 0);
+  });
+});
+
+describe("timeouts", () => {
+  it("gives up when the device never answers", async () => {
+    const { m } = manager();
+    const r = await m.submit("P1", { telemetry_interval_ms: 10_000 }, "admin");
+    await settled();
+    m.tick(r.requestedAt + OPTS.ackTimeoutMs - 1);
+    assert.equal(m.stats.timedOut, 0);
+    m.tick(r.requestedAt + OPTS.ackTimeoutMs);
+    await settled();
+    assert.equal(m.stats.timedOut, 1);
+  });
+
+  it("gives up when an acknowledged restart never comes back", async () => {
+    const { m } = manager();
+    const r = await m.submit("P1", { can_baud_kbps: 500 }, "admin");
+    await settled();
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { request_id: r.id, status: "accepted" });
+    await settled();
+    const acked = m.openRequests()[0].ackedAt ?? 0;
+    m.tick(acked + OPTS.restartGraceMs);
+    await settled();
+    assert.equal(m.stats.timedOut, 1);
+    assert.equal(m.stats.applied, 0);
+  });
+});

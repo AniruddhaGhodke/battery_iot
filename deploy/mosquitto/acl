@@ -2,10 +2,19 @@
 # One shared account for all packs for now; per-pack accounts can replace it
 # later (TODO 7), e.g. "pattern write emspl/a7f3c2/%u/data".
 
-# The packs: publish telemetry, nothing else.
+# The packs: publish telemetry and configuration acknowledgements, and read
+# the configuration sent to them. Nothing else.
 user emspl-device
 topic write emspl/a7f3c2/+/data
+topic write emspl/a7f3c2/+/config/ack
+topic read emspl/a7f3c2/+/config/set
 
-# The ingest worker: read telemetry, nothing else.
+# The ingest worker: read telemetry and acknowledgements, and publish
+# configuration. It is the only client allowed to write config/set, which is
+# what stops anything else reconfiguring a pack. The dashboard has no broker
+# credentials at all and goes through ingest over HTTP (README, "Remote
+# configuration").
 user bms-ingest
 topic read emspl/a7f3c2/+/data
+topic read emspl/a7f3c2/+/config/ack
+topic write emspl/a7f3c2/+/config/set

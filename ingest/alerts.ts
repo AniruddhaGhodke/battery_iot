@@ -114,6 +114,11 @@ export class AlertEngine {
   private lastReading = new Map<string, Reading>();
   /** Keys restored as active from the database, not yet re-confirmed. */
   private restored = new Set<string>();
+  /**
+   * Packs we have told to restart, and until when. A deliberate
+   * configuration change must not raise an offline alert.
+   */
+  private expectedSilence = new Map<string, number>();
   private startedAt: number;
 
   constructor(opts: AlertOptions, now: number, restored: ActiveRecord[] = []) {
@@ -139,6 +144,14 @@ export class AlertEngine {
     }
   }
 
+  /**
+   * Do not call this pack offline before `untilMs` — it is restarting because
+   * we asked it to (ingest/commands.ts).
+   */
+  expectSilence(pack: string, untilMs: number) {
+    this.expectedSilence.set(pack, untilMs);
+  }
+
   /** Raised conditions, for /status. */
   active(): { pack: string | null; condition: string; since: number; notified: boolean }[] {
     return [...this.states.values()]
@@ -153,6 +166,7 @@ export class AlertEngine {
     // proves the pack is back, but its alarms are not news any more.
     this.lastSeen.set(pack, now);
     this.restored.delete(keyOf(pack, "offline"));
+    this.expectedSilence.delete(pack);
     if (this.opts.mutedPacks.includes(pack)) return [];
     this.setTruth(pack, "offline", false, "", now);
     if (r.replay) return this.step(now);
@@ -195,8 +209,12 @@ export class AlertEngine {
       const key = keyOf(pack, "offline");
       const seen = this.lastSeen.get(pack);
       const silentFor = now - (seen ?? this.startedAt);
+      const until = this.expectedSilence.get(pack);
+      if (until !== undefined && now >= until) this.expectedSilence.delete(pack);
       // Restored "offline" stays raised until the pack actually sends.
-      const offline = this.restored.has(key) || silentFor >= this.opts.offlineMs;
+      const offline =
+        !(until !== undefined && now < until) &&
+        (this.restored.has(key) || silentFor >= this.opts.offlineMs);
       const last = seen ?? this.startedAt;
       this.setTruth(pack, "offline", offline, seen === undefined ? `No data since ingest started at ${clock(last)}.` : `No data since ${clock(last)}.`, now);
     }

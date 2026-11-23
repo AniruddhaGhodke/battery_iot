@@ -6,6 +6,10 @@
  * Every accepted reading also goes to the alert engine (notifier.ts), which
  * sends WhatsApp messages for alarms, silent packs and outages.
  *
+ * It is also the only process that publishes: remote configuration arrives
+ * over HTTP from the web container and goes out on the config topic
+ * (commands.ts), so the broker password never leaves this container.
+ *
  * Also serves GET /status and /health on STATUS_PORT. In Docker that port
  * is only reachable from the web container, never published.
  *
@@ -18,6 +22,7 @@ import postgres from "postgres";
 import { migrate } from "../db/migrate.ts";
 import type { IngestStatus } from "../lib/ingest-status.ts";
 import { parseReading, PayloadError, type Reading } from "../lib/telemetry.ts";
+import { ConfigError, ConfigManager, subscriptionFor } from "./commands.ts";
 import { config } from "./config.ts";
 import { diagnose } from "../lib/diagnose.ts";
 import { gatherWindow } from "./diagnose-data.ts";
@@ -96,6 +101,7 @@ const diagnoseAlert: DiagnoseFn = async (condition, deviceId) => {
 const notifier = new Notifier(sql, config.alerts, undefined, diagnoseAlert);
 await notifier.start();
 const alertTimer = setInterval(() => {
+  configs?.tick();
   notifier.tick(packs.enabledDevices(), {
     mqttConnected: mqttStats.connected,
     mqttError: mqttStats.lastError,
@@ -104,6 +110,20 @@ const alertTimer = setInterval(() => {
     buffered: writer.stats.buffered,
   });
 }, 5_000);
+
+// Where the pack's own segment sits in the telemetry topic, e.g. index 2 in
+// emspl/a7f3c2/+/data. Used to learn which topic each device publishes on.
+const SLUG_INDEX = config.mqttTopic.split("/").indexOf("+");
+const ACK_SUBSCRIPTION = subscriptionFor(config.remoteConfig.ackTopic);
+const ACK_PREFIX = config.remoteConfig.ackTopic.split("{slug}")[0];
+const ACK_SUFFIX = config.remoteConfig.ackTopic.split("{slug}").at(-1) ?? "";
+
+/** An acknowledgement topic rather than telemetry. */
+function isAckTopic(topic: string): boolean {
+  return topic.startsWith(ACK_PREFIX) && topic.endsWith(ACK_SUFFIX) && topic !== ACK_PREFIX;
+}
+
+let configs: ConfigManager | undefined;
 
 // Last arrival-time ts per pack. When the broker delivers a queued backlog
 // (after an ingest restart) many messages arrive in the same millisecond;
@@ -135,6 +155,11 @@ function store(packId: number | null, reading: Reading) {
   writer.push(packId, reading);
   msgStats.accepted++;
   notifier.observe(reading);
+  if (SLUG_INDEX >= 0) {
+    const slug = reading.topic.split("/")[SLUG_INDEX];
+    if (slug) packs.noteTopic(reading.packId, slug);
+  }
+  configs?.onTelemetry(reading.packId);
 }
 
 function handleMessage(topic: string, payload: Buffer) {
@@ -151,6 +176,11 @@ function handleMessage(topic: string, payload: Buffer) {
     doc = JSON.parse(payload.toString("utf8"));
   } catch {
     msgStats.rejected.notJson++;
+    return;
+  }
+  // Configuration acknowledgements share the connection but are not readings.
+  if (isAckTopic(topic)) {
+    configs?.handleAck(topic, doc);
     return;
   }
   const deviceId =
@@ -196,15 +226,19 @@ client.on("connect", (ack) => {
   mqttStats.lastError = null;
   // With a resumed session the broker remembers the subscription, but
   // subscribing again is harmless and covers a changed MQTT_TOPIC.
-  client.subscribe(config.mqttTopic, { qos: 1 }, (err, granted) => {
+  client.subscribe([config.mqttTopic, ACK_SUBSCRIPTION], { qos: 1 }, (err, granted) => {
     if (err) mqttStats.lastError = `subscribe failed: ${err.message}`;
-    else if (granted?.some((g) => g.qos === 128)) {
-      mqttStats.lastError = `broker refused subscription to ${config.mqttTopic}`;
+    else {
+      const refused = granted?.filter((g) => g.qos === 128).map((g) => g.topic) ?? [];
+      if (refused.length) {
+        // Almost always the ACL: see README, "Remote configuration".
+        mqttStats.lastError = `broker refused subscription to ${refused.join(", ")}`;
+      }
     }
   });
   console.log(
     `[mqtt] connected to ${config.mqttUrl} as ${config.mqttClientId}` +
-      `${ack.sessionPresent ? " (resumed session)" : ""}, subscribed to ${config.mqttTopic}`,
+      `${ack.sessionPresent ? " (resumed session)" : ""}, subscribed to ${config.mqttTopic} and ${ACK_SUBSCRIPTION}`,
   );
 });
 client.on("close", () => {
@@ -216,6 +250,12 @@ client.on("error", (err) => {
   mqttStats.lastError = err.message;
   console.warn(`[mqtt] ${err.message}`);
 });
+configs = new ConfigManager(sql, client, config.remoteConfig, {
+  resolve: (deviceId) => packs.resolve(deviceId),
+  expectSilence: (deviceId, until) => notifier.expectSilence(deviceId, until),
+});
+await configs.start();
+
 client.on("message", handleMessage);
 
 if (!config.allowedDevices.length && !config.autoRegister && packs.count === 0) {
@@ -237,14 +277,85 @@ function status(): IngestStatus {
       unknown: [...packs.unknown.entries()].map(([deviceId, u]) => ({ deviceId, ...u })),
     },
     alerts: { ...notifier.stats, active: notifier.active() },
+    config: {
+      ...(configs?.stats ?? { submitted: 0, sent: 0, applied: 0, rejected: 0, timedOut: 0, failed: 0 }),
+      open: (configs?.openRequests() ?? []).map((r) => ({
+        id: r.id,
+        deviceId: r.deviceId,
+        status: r.status,
+        requestedAt: r.requestedAt,
+      })),
+    },
   };
 }
 
+function json(res: http.ServerResponse, code: number, body: unknown) {
+  res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(body));
+}
+
+const MAX_BODY = 16 * 1024;
+
+function readJson(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        reject(new ConfigError("request body too large", 413));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        reject(new ConfigError("body is not JSON", 400));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+/**
+ * POST /config — the only way into the broker from outside this container.
+ * Reachable from the web container alone; never published (compose).
+ */
+async function postConfig(req: http.IncomingMessage, res: http.ServerResponse) {
+  try {
+    const body = (await readJson(req)) as Record<string, unknown>;
+    const deviceId = typeof body.device_id === "string" ? body.device_id.trim() : "";
+    if (!deviceId) throw new ConfigError("device_id is required", 400);
+    if (!configs) throw new ConfigError("ingest is still starting up", 503);
+    const by = typeof body.requested_by === "string" && body.requested_by.trim()
+      ? body.requested_by.trim().slice(0, 100)
+      : "unknown";
+    const r = await configs.submit(deviceId, body.settings, by);
+    json(res, 202, {
+      id: r.id,
+      device_id: r.deviceId,
+      status: r.status,
+      settings: r.settings,
+      restarts: r.restarts,
+    });
+  } catch (e) {
+    if (e instanceof ConfigError) json(res, e.status, { error: e.message, details: e.details });
+    else {
+      console.warn(`[config] request failed: ${(e as Error).message}`);
+      json(res, 500, { error: (e as Error).message });
+    }
+  }
+}
+
 const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
+  if (req.method === "POST" && req.url === "/config") {
+    void postConfig(req, res);
+  } else if (req.url === "/health") {
     res.writeHead(200, { "content-type": "text/plain" }).end("ok");
   } else if (req.url === "/status") {
-    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(status()));
+    json(res, 200, status());
   } else {
     res.writeHead(404).end();
   }

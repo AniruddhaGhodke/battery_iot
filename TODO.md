@@ -3,8 +3,9 @@
 Step 1 (live dashboard from MQTT) and step 2 (persistent history, Docker)
 are done. The order we're working in, and why, is in [PLAN.md](PLAN.md).
 Basic alerts with WhatsApp notifications are done (README, "WhatsApp
-alerts"); the rest of 3 and 6 and remote commands (8) are deferred: noted,
-not scheduled.
+alerts"), and remote configuration of the two gateway settings the firmware
+supports (README, "Remote configuration"). The rest of 3 and 6, and BMS
+setpoints and channel control over CAN, are deferred: noted, not scheduled.
 
 The earlier Python implementation in `../bms_iot` already solves most of
 these and has tests. Treat it as the reference when porting; file pointers are

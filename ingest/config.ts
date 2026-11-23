@@ -43,6 +43,17 @@ export const config = {
   // If the database is down, keep at most this many readings in memory.
   bufferMaxRows: int(process.env.BUFFER_MAX_ROWS, 50_000),
 
+  // Remote configuration (ingest/commands.ts; README, "Remote configuration").
+  // {slug} is the pack's own topic segment, learned from its telemetry topic.
+  remoteConfig: {
+    setTopic: process.env.CONFIG_SET_TOPIC || "emspl/a7f3c2/{slug}/config/set",
+    ackTopic: process.env.CONFIG_ACK_TOPIC || "emspl/a7f3c2/{slug}/config/ack",
+    // No acknowledgement within this and the request is given up on.
+    ackTimeoutMs: int(process.env.CONFIG_ACK_TIMEOUT_S, 20) * 1000,
+    // After an acknowledged restart, how long telemetry may take to return.
+    restartGraceMs: int(process.env.CONFIG_RESTART_GRACE_S, 120) * 1000,
+  },
+
   statusPort: int(process.env.STATUS_PORT, 3101),
 
   // WhatsApp alerts (ingest/alerts.ts; README, "WhatsApp alerts"). Off unless

@@ -8,7 +8,7 @@
 
 import type { Sql } from "postgres";
 
-type Entry = { id: number; enabled: boolean };
+type Entry = { id: number; enabled: boolean; slug: string | null };
 
 const REFRESH_MS = 30_000;
 const UNKNOWN_MAX = 50;
@@ -44,9 +44,35 @@ export class PackRegistry {
   }
 
   async refresh() {
-    const rows = await this.sql<{ id: number; device_id: string; enabled: boolean }[]>`
-      select id, device_id, enabled from packs`;
-    this.byDevice = new Map(rows.map((r) => [r.device_id, { id: r.id, enabled: r.enabled }]));
+    const rows = await this.sql<
+      { id: number; device_id: string; enabled: boolean; topic_slug: string | null }[]
+    >`select id, device_id, enabled, topic_slug from packs`;
+    this.byDevice = new Map(
+      rows.map((r) => [r.device_id, { id: r.id, enabled: r.enabled, slug: r.topic_slug }]),
+    );
+  }
+
+  /**
+   * Records which topic segment a pack publishes under, so configuration can
+   * be addressed to it. Learned from the telemetry topic rather than
+   * configured by hand, and only written when it changes.
+   */
+  noteTopic(deviceId: string, slug: string) {
+    const e = this.byDevice.get(deviceId);
+    if (!e || e.slug === slug) return;
+    e.slug = slug;
+    this.sql`update packs set topic_slug = ${slug} where id = ${e.id}`
+      .then(() => console.log(`[packs] ${deviceId} publishes on "${slug}"`))
+      .catch((err) => {
+        e.slug = null; // try again on the next reading
+        console.warn(`[packs] could not record the topic for ${deviceId}: ${(err as Error).message}`);
+      });
+  }
+
+  /** Database id and topic slug for an enabled pack, for addressing a command. */
+  resolve(deviceId: string): { packId: number; slug: string | null } | null {
+    const e = this.byDevice.get(deviceId);
+    return e && e.enabled ? { packId: e.id, slug: e.slug } : null;
   }
 
   /** device_ids of enabled packs (the alert engine watches these for silence). */
@@ -90,11 +116,12 @@ export class PackRegistry {
   private insert(deviceId: string): Promise<Entry | null> {
     let p = this.registering.get(deviceId);
     if (!p) {
-      p = this.sql<{ id: number; enabled: boolean }[]>`
+      p = this.sql<{ id: number; enabled: boolean; topic_slug: string | null }[]>`
           insert into packs (device_id) values (${deviceId})
           on conflict (device_id) do update set device_id = excluded.device_id
-          returning id, enabled`
-        .then(([row]) => {
+          returning id, enabled, topic_slug`
+        .then(([r]) => {
+          const row: Entry = { id: r.id, enabled: r.enabled, slug: r.topic_slug };
           this.byDevice.set(deviceId, row);
           console.log(`[packs] registered ${deviceId}`);
           return row;

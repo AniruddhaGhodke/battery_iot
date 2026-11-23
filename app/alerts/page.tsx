@@ -111,9 +111,20 @@ export default async function AlertsPage() {
             <p className="text-xs text-ink-3">What was raised, why, and what to check</p>
           </div>
         </div>
-        <Link href="/" className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 hover:border-brand-light">
-          ← Live dashboard
-        </Link>
+        <nav className="flex items-center gap-2">
+          <Link
+            href="/settings"
+            className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 hover:border-brand-light"
+          >
+            Settings
+          </Link>
+          <Link
+            href="/"
+            className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 hover:border-brand-light"
+          >
+            ← Live dashboard
+          </Link>
+        </nav>
       </header>
 
       {error && (

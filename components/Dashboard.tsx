@@ -166,6 +166,12 @@ export default function Dashboard() {
           >
             Alerts
           </a>
+          <a
+            href="/settings"
+            className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 transition hover:border-brand-light"
+          >
+            Settings
+          </a>
           <ConnectionBadge status={status} apiDown={apiDown} />
         </div>
       </header>

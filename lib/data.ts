@@ -9,6 +9,7 @@
 
 import { config } from "./config";
 import { sql } from "./db";
+import { staleAfterMs } from "./pack-config";
 import type { Status } from "./ingest-status";
 import type { Reading } from "./telemetry";
 
@@ -25,6 +26,8 @@ export type PackSummary = {
   soc: number | null;
   spreadMv: number | null;
   activeAlarms: string[];
+  /** The configured publish interval, when we have set one. */
+  telemetryIntervalMs: number | null;
 };
 
 export type PackDetail = {
@@ -88,13 +91,18 @@ export async function listPacks(): Promise<PackSummary[]> {
       (l.reading->>'current')::float8      as current,
       (l.reading->>'soc')::float8          as soc,
       (l.reading->>'spreadMv')::float8     as "spreadMv",
-      coalesce(l.reading->'activeAlarms', '[]'::jsonb) as "activeAlarms"
+      coalesce(l.reading->'activeAlarms', '[]'::jsonb) as "activeAlarms",
+      p.telemetry_interval_ms              as "telemetryIntervalMs"
     from packs p
     join pack_latest l on l.pack_id = p.id
     where p.enabled
     order by p.device_id`;
   const now = Date.now();
-  return rows.map((r) => ({ ...r, online: now - r.lastSeen < config.staleAfterS * 1000 }));
+  // A pack set to publish every few minutes is not offline between messages.
+  return rows.map((r) => ({
+    ...r,
+    online: now - r.lastSeen < staleAfterMs(r.telemetryIntervalMs, config.staleAfterS * 1000),
+  }));
 }
 
 export async function getPack(deviceId: string): Promise<PackDetail | null> {

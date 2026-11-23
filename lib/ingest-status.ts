@@ -44,6 +44,19 @@ export type IngestStatus = {
   };
   /** WhatsApp alerts. Missing from an ingest older than the alerts feature. */
   alerts?: AlertStatus;
+  /** Remote configuration. Missing from an ingest older than that feature. */
+  config?: ConfigStatus;
+};
+
+export type ConfigStatus = {
+  submitted: number;
+  sent: number;
+  applied: number;
+  rejected: number;
+  timedOut: number;
+  failed: number;
+  /** Requests still waiting on a device. */
+  open: { id: number; deviceId: string; status: string; requestedAt: number }[];
 };
 
 export type AlertStatus = {
