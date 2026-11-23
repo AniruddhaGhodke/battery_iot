@@ -8,7 +8,14 @@ import {
   subscriptionFor,
   topicFor,
 } from "../ingest/commands.ts";
-import { fieldError, FIELD_BY_KEY, staleAfterMs, validateSettings } from "../lib/pack-config.ts";
+import {
+  CONFIG_FIELDS,
+  fieldError,
+  FIELD_BY_KEY,
+  sendableFields,
+  staleAfterMs,
+  validateSettings,
+} from "../lib/pack-config.ts";
 
 const OPTS = {
   setTopic: "emspl/a7f3c2/{slug}/config/set",
@@ -273,7 +280,7 @@ describe("timeouts", () => {
 
   it("gives up when an acknowledged restart never comes back", async () => {
     const { m } = manager();
-    const r = await m.submit("P1", { can_baud_kbps: 500 }, "admin");
+    const r = await m.submit("P1", { can_baud_kbps: 250 }, "admin");
     await settled();
     m.handleAck("emspl/a7f3c2/pack1/config/ack", { request_id: r.id, status: "accepted" });
     await settled();
@@ -282,5 +289,60 @@ describe("timeouts", () => {
     await settled();
     assert.equal(m.stats.timedOut, 1);
     assert.equal(m.stats.applied, 0);
+  });
+});
+
+describe("pending fields", () => {
+  it("refuses a setting the firmware does not forward yet, even if it is in range", () => {
+    const v = validateSettings({ bms_over_discharge_mv: 2500 });
+    assert.equal(v.ok, false);
+    assert.match(v.ok === false ? v.errors[0] : "", /does not forward this yet/);
+  });
+
+  it("refuses the whole request if any field is pending", () => {
+    const v = validateSettings({ telemetry_interval_ms: 5000, bms_over_charge_mv: 3650 });
+    assert.equal(v.ok, false);
+  });
+
+  it("only exposes the gateway settings as sendable today", () => {
+    assert.deepEqual(
+      sendableFields().map((f) => f.key),
+      ["can_baud_kbps", "telemetry_interval_ms"],
+    );
+  });
+
+  it("offers 250 kbps only, so the BMS link cannot be silenced from here", () => {
+    const f = FIELD_BY_KEY.can_baud_kbps;
+    assert.equal(f.kind, "enum");
+    assert.deepEqual(f.kind === "enum" ? f.values : [], [250]);
+    assert.equal(validateSettings({ can_baud_kbps: 500 }).ok, false);
+    assert.equal(validateSettings({ can_baud_kbps: 250 }).ok, true);
+  });
+
+  it("gives every BMS field a CAN command id, so firmware knows what to write", () => {
+    for (const f of CONFIG_FIELDS.filter((x) => x.target === "bms")) {
+      assert.match(f.canCommand ?? "", /^0x[0-9A-F]{2}$/, `${f.key} has no CAN command`);
+    }
+  });
+
+  it("keeps the inverted balance encoding from the protocol", () => {
+    // 0x08 is the one command where 2 means on and 1 means off.
+    const f = FIELD_BY_KEY.bms_auto_balance;
+    assert.equal(f.kind, "bool");
+    if (f.kind === "bool") {
+      assert.equal(f.onValue, 2);
+      assert.equal(f.offValue, 1);
+    }
+  });
+
+  it("bounds every protection setpoint", () => {
+    for (const f of CONFIG_FIELDS.filter((x) => x.group === "protection")) {
+      assert.ok(f.kind === "range" || f.kind === "enum", `${f.key} is unbounded`);
+      if (f.kind === "range") {
+        assert.ok(f.min < f.max, `${f.key} has a nonsense range`);
+        assert.ok(fieldError(f, f.min - 1) !== null, `${f.key} accepts below its minimum`);
+        assert.ok(fieldError(f, f.max + 1) !== null, `${f.key} accepts above its maximum`);
+      }
+    }
   });
 });

@@ -334,21 +334,81 @@ the settings page says so.
 
 ### Settings
 
-Only what the firmware supports today, defined once in `lib/pack-config.ts`
-so the form and the server agree:
+Defined once in `lib/pack-config.ts` so the form and the server agree. Unknown
+keys are rejected rather than forwarded — a device that receives a key it does
+not understand may ignore the whole message. The browser is not trusted:
+ingest validates every request again.
 
-| Key | Values | Restarts the device |
+**Can be sent today** (the gateway's own behaviour):
+
+| Key | Values | Restarts |
 |---|---|---|
-| `can_baud_kbps` | 250 or 500 | yes |
-| `telemetry_interval_ms` | 1,000–300,000 | no |
+| `can_baud_kbps` | 250 only | yes |
+| `telemetry_interval_ms` | 1,000–300,000 ms | no |
 
-Unknown keys are rejected rather than forwarded — a device that receives a key
-it does not understand may ignore the whole message. The browser is not
-trusted: ingest validates every request again.
+250 is the only bitrate offered. The 192S protocol runs at 250 kHz and has no
+bitrate command, so 500 would silence the BMS link; the field is kept only so
+a pack can be put back if it is ever mis-set by other means.
 
-**On the bitrate:** the 192S BMS protocol runs at 250 kbps and has no bitrate
-command of its own, so setting 500 will stop the pack reading its BMS. The
-pack itself stays reachable over WiFi, so it can be set back.
+**Defined but not sendable yet** — the BMS accepts all of these on CAN id
+`0xF4`, but the gateway firmware does not forward them from MQTT. They are
+listed so the values and limits can be agreed before firmware work starts, and
+`validateSettings` refuses them until the `pending` flag is cleared.
+
+| Key | CAN | Range | Group |
+|---|---|---|---|
+| `bms_over_discharge_mv` | `0x01` | 2,000–3,000 mV/cell | protection |
+| `bms_over_charge_mv` | `0x05` | 3,400–3,800 mV/cell | protection |
+| `bms_over_current_a` | `0x02` | 1–1,000 A | protection |
+| `bms_over_temperature_c` | `0x06` | 0–100 °C | protection |
+| `bms_low_temperature_c` | `0x18` | −100–0 °C | protection |
+| `bms_discharge_recovery_mv` | `0x0B` | 2,000–3,300 mV/cell | protection |
+| `bms_charge_recovery_mv` | `0x0A` | 3,200–3,700 mV/cell | protection |
+| `bms_cell_diff_mv` | `0x17` | 0–5,000 mV | protection |
+| `bms_power_off_mv` | `0x0E` | 2,000–3,300 mV/cell | protection |
+| `bms_power_off_delay_s` | `0x0F` | 0–3,600 s | protection |
+| `bms_auto_balance` | `0x08` | on / off | balancing |
+| `bms_balance_start_mv` | `0x11` | 3,000–3,700 mV/cell | balancing |
+| `bms_fan_start_c` | `0x1A` | 0–100 °C | thermal |
+| `bms_ptc_start_c` | `0x1B` | 0–100 °C | thermal |
+| `bms_capacity_ah` | `0x03` | 1–10,000 Ah | commissioning |
+| `bms_series_count` | `0x04` | 1–192 | commissioning |
+| `bms_hall_sensor` | `0x19` | 1, 2 or 3 | commissioning |
+| `bms_precharge_delay_s` | `0x16` | 0–600 s | commissioning |
+
+### For whoever writes the gateway firmware
+
+Three things the protocol document does not settle, which have to be agreed
+before any of the BMS fields are enabled:
+
+1. **Scaling is not stated anywhere.** The protocol gives a 16-bit value per
+   command but never its units — whether a voltage is mV, 10 mV or pack volts,
+   or whether a temperature is whole degrees or tenths. **MQTT carries
+   engineering units** (mV per cell, A, °C) and the firmware owns the
+   conversion, because the firmware can check its own writes against the
+   BMS's broadcast of the same values in groups 1, 2 and 5. A factor-of-ten
+   error on a protection setpoint disables protection, so none of these fields
+   should be enabled until a write has been confirmed by read-back.
+2. **Are the voltage setpoints per cell or per pack?** The fields above assume
+   per cell, which is how a BMS protects cells, but the document does not say.
+   Confirm before enabling.
+3. **`0x08` is encoded backwards from everything else.** Auto-balance uses
+   `0x0002` for on and `0x0001` for off, while `0x07`, `0x0C`, `0x0D` and
+   `0x15` all use `0x0001` for on. `lib/pack-config.ts` keeps the inversion,
+   but it is an easy one to get wrong in firmware.
+
+Also worth doing while the firmware is open: **forward the setpoints the BMS
+already broadcasts** (groups 1, 2, 5 and the MOS status in group 81) in the
+telemetry payload. They are on the wire now and simply dropped. That gives
+read-back for nothing, which is how "applied" should really be confirmed, and
+lets the dashboard show the limits in force.
+
+**Not included here: channel control** (`0x07`) and the power-on default
+state (`0x0C`). Opening or closing the contactor is a control action, not a
+setting — it needs its own confirmation step, an interlock against switching
+under load, and a command expiry so a queued message cannot fire hours later
+when a pack reconnects. Worth building deliberately rather than as another row
+in this form.
 
 ### What the firmware must publish
 

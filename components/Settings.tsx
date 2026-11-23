@@ -7,6 +7,11 @@ import {
   type ConfigKey,
   type ConfigSettings,
   fieldError,
+  FIELD_BY_KEY,
+  FIELD_GROUPS,
+  type FieldSpec,
+  GROUP_HELP,
+  GROUP_LABEL,
   isFinal,
   STATUS_LABEL,
 } from "@/lib/pack-config";
@@ -46,10 +51,105 @@ function when(ms: number): string {
 function describe(s: ConfigSettings): string {
   return Object.entries(s)
     .map(([k, v]) => {
-      const f = CONFIG_FIELDS.find((x) => x.key === k);
-      return `${f?.label ?? k} ${Number(v).toLocaleString("en-IN")} ${f?.unit ?? ""}`.trim();
+      const f = FIELD_BY_KEY[k as ConfigKey];
+      if (!f) return `${k} ${String(v)}`;
+      if (f.kind === "bool") return `${f.label} ${v === f.onValue ? "on" : "off"}`;
+      return `${f.label} ${Number(v).toLocaleString("en-IN")} ${f.unit}`.trim();
     })
     .join(", ");
+}
+
+/** One setting: a tick to include it, and its value. Disabled when pending. */
+function Field({
+  f,
+  checked,
+  value,
+  onToggle,
+  onValue,
+}: {
+  f: FieldSpec;
+  checked: boolean;
+  value: string;
+  onToggle: (on: boolean) => void;
+  onValue: (v: string) => void;
+}) {
+  const pending = !!f.pending;
+  return (
+    <div
+      className={`rounded-lg border p-3 ${pending ? "border-line/60 bg-surface-2/50" : "border-line bg-surface-2"}`}
+    >
+      <label className={`flex items-start gap-2 ${pending ? "cursor-not-allowed" : "cursor-pointer"}`}>
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={pending}
+          onChange={(e) => onToggle(e.target.checked)}
+          className="mt-1 size-4 accent-brand disabled:opacity-40"
+        />
+        <span className="min-w-0">
+          <span className={`text-sm font-medium ${pending ? "text-ink-3" : "text-ink"}`}>{f.label}</span>
+          {f.unit && <span className="ml-1 text-xs text-ink-3">({f.unit})</span>}
+          {f.canCommand && (
+            <span className="ml-2 rounded border border-line bg-white px-1.5 py-0.5 font-mono text-[10px] text-ink-3">
+              CAN {f.canCommand}
+            </span>
+          )}
+          {pending && (
+            <span className="ml-2 rounded border border-warn/40 bg-warn-bg px-1.5 py-0.5 text-[10px] font-medium text-warn">
+              Awaiting firmware
+            </span>
+          )}
+          <span className="block text-xs text-ink-2">{f.help}</span>
+        </span>
+      </label>
+
+      {checked && !pending && (
+        <div className="mt-2 pl-6">
+          {f.kind === "enum" ? (
+            <select
+              value={value}
+              onChange={(e) => onValue(e.target.value)}
+              className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink focus:border-brand focus:outline-none"
+            >
+              <option value="">Choose…</option>
+              {f.values.map((v) => (
+                <option key={v} value={v}>
+                  {v} {f.unit}
+                </option>
+              ))}
+            </select>
+          ) : f.kind === "bool" ? (
+            <select
+              value={value}
+              onChange={(e) => onValue(e.target.value)}
+              className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink focus:border-brand focus:outline-none"
+            >
+              <option value="">Choose…</option>
+              <option value={f.onValue}>On</option>
+              <option value={f.offValue}>Off</option>
+            </select>
+          ) : (
+            <input
+              type="number"
+              inputMode="numeric"
+              min={f.min}
+              max={f.max}
+              step={f.step}
+              value={value}
+              onChange={(e) => onValue(e.target.value)}
+              placeholder={`${f.min.toLocaleString("en-IN")}–${f.max.toLocaleString("en-IN")}`}
+              className="w-48 rounded-lg border border-line bg-white px-3 py-2 text-sm tabular-nums text-ink focus:border-brand focus:outline-none"
+            />
+          )}
+          {f.restarts && (
+            <p className="mt-1 text-xs text-ink-3">
+              The device restarts after accepting this, so telemetry stops briefly.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function Settings({ initial }: { initial: Payload }) {
@@ -149,8 +249,8 @@ export function Settings({ initial }: { initial: Payload }) {
     }
   }
 
-  const bitrateChosen = include.can_baud_kbps && values.can_baud_kbps === "500";
   const addressable = pack?.topicSlug != null;
+  const pendingCount = CONFIG_FIELDS.filter((f) => f.pending).length;
 
   return (
     <div className="space-y-6">
@@ -208,69 +308,46 @@ export function Settings({ initial }: { initial: Payload }) {
           Only ticked settings are sent. Anything left unticked is not touched on the device.
         </p>
 
-        <div className="mt-3 space-y-3">
-          {CONFIG_FIELDS.map((f) => (
-            <div key={f.key} className="rounded-lg border border-line bg-surface-2 p-3">
-              <label className="flex items-start gap-2">
-                <input
-                  type="checkbox"
-                  checked={!!include[f.key]}
-                  onChange={(e) => setInclude((p) => ({ ...p, [f.key]: e.target.checked }))}
-                  className="mt-1 size-4 accent-brand"
-                />
-                <span>
-                  <span className="text-sm font-medium text-ink">{f.label}</span>
-                  <span className="ml-1 text-xs text-ink-3">({f.unit})</span>
-                  <span className="block text-xs text-ink-2">{f.help}</span>
-                </span>
-              </label>
-
-              {include[f.key] && (
-                <div className="mt-2 pl-6">
-                  {f.kind === "enum" ? (
-                    <select
-                      value={values[f.key] ?? ""}
-                      onChange={(e) => setField(f.key, e.target.value)}
-                      className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink focus:border-brand focus:outline-none"
-                    >
-                      <option value="">Choose…</option>
-                      {f.values.map((v) => (
-                        <option key={v} value={v}>
-                          {v} {f.unit}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      type="number"
-                      inputMode="numeric"
-                      min={f.min}
-                      max={f.max}
-                      step={f.step}
-                      value={values[f.key] ?? ""}
-                      onChange={(e) => setField(f.key, e.target.value)}
-                      placeholder={`${f.min.toLocaleString("en-IN")}–${f.max.toLocaleString("en-IN")}`}
-                      className="w-48 rounded-lg border border-line bg-white px-3 py-2 text-sm tabular-nums text-ink focus:border-brand focus:outline-none"
-                    />
-                  )}
-                  {f.restarts && (
-                    <p className="mt-1 text-xs text-ink-3">
-                      The device restarts after accepting this, so telemetry stops briefly.
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-
-        {bitrateChosen && (
-          <p className="mt-3 rounded-lg border border-crit/40 bg-crit-bg p-3 text-sm text-crit">
-            500 kbps will stop this pack reading its BMS. The 192S protocol runs at 250 kbps and has
-            no bitrate command of its own, so the pack will come back online but report nothing until
-            you set it to 250 again.
+        {pendingCount > 0 && (
+          <p className="mt-3 rounded-lg border border-line bg-surface-2 p-3 text-xs text-ink-2">
+            <span className="font-medium text-ink">{pendingCount} settings are listed but cannot be sent yet.</span>{" "}
+            The BMS accepts them over CAN, but the gateway firmware does not forward them from MQTT.
+            They are shown so the values and limits are agreed before firmware work starts.
           </p>
         )}
+
+        <div className="mt-4 space-y-5">
+          {FIELD_GROUPS.map((g) => {
+            const fields = CONFIG_FIELDS.filter((f) => f.group === g);
+            if (!fields.length) return null;
+            return (
+              <div key={g}>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-3">
+                  {GROUP_LABEL[g]}
+                </h3>
+                <p className="mt-0.5 text-xs text-ink-2">{GROUP_HELP[g]}</p>
+                <div className="mt-2 space-y-2">
+                  {fields.map((f) => (
+                    <Field
+                      key={f.key}
+                      f={f}
+                      checked={!!include[f.key]}
+                      value={values[f.key] ?? ""}
+                      onToggle={(on) => {
+                        setInclude((p) => ({ ...p, [f.key]: on }));
+                        // Nothing to choose when there is only one value.
+                        if (on && f.kind === "enum" && f.values.length === 1) {
+                          setField(f.key, String(f.values[0]));
+                        }
+                      }}
+                      onValue={(v) => setField(f.key, v)}
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
 
         {error && (
           <ul className="mt-3 list-disc space-y-1 rounded-lg border border-crit/40 bg-crit-bg p-3 pl-7 text-sm text-crit">
