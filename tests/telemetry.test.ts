@@ -26,6 +26,36 @@ function payload(extra: Record<string, unknown> = {}, telemetry: Record<string, 
   };
 }
 
+describe("device identity", () => {
+  it("reads the hardware UID, firmware version and clock state", () => {
+    const r = parseReading(
+      payload({ device_uid: "aabbccddeeff", firmware_version: "1.1.0", time_synced: true }),
+      "P",
+      "t",
+      NOW,
+    );
+    // Normalised: the firmware sends it uppercase, but target_uid is compared
+    // byte for byte, so one case has to win here.
+    assert.equal(r.deviceUid, "AABBCCDDEEFF");
+    assert.equal(r.firmwareVersion, "1.1.0");
+    assert.equal(r.timeSynced, true);
+  });
+
+  it("ignores a UID that is not twelve hex digits", () => {
+    for (const bad of ["", "ZZZZZZZZZZZZ", "AABBCCDDEE", "AABBCCDDEEFF00", 42, null]) {
+      assert.equal(parseReading(payload({ device_uid: bad }), "P", "t", NOW).deviceUid, null);
+    }
+  });
+
+  it("leaves the old firmware's payloads addressable only by name", () => {
+    // The build running today sends none of these three fields.
+    const r = parseReading(payload(), "P", "t", NOW);
+    assert.equal(r.deviceUid, null);
+    assert.equal(r.firmwareVersion, null);
+    assert.equal(r.timeSynced, false);
+  });
+});
+
 describe("parseReading", () => {
   it("cuts trailing padding and derives cell figures", () => {
     const r = parseReading(payload(), "P", "t", NOW);

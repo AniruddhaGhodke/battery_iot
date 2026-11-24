@@ -17,6 +17,15 @@ export type Alarms = {
 
 export type Reading = {
   packId: string;
+  /**
+   * Immutable hardware id from the board's eFuse MAC. Null on firmware older
+   * than the one that sends it. This, not packId, is what a command targets.
+   */
+  deviceUid: string | null;
+  /** Firmware version the board reports, for confirming an update landed. */
+  firmwareVersion: string | null;
+  /** The board says its clock is NTP-synced. */
+  timeSynced: boolean;
   topic: string;
   /**
    * Ordering time, epoch ms: deviceTime when the device says its clock is
@@ -203,6 +212,8 @@ export function parseReading(
     ALARM_KEYS.map((k) => [k, a[k] === true]),
   ) as Alarms;
 
+  const uid = typeof d.device_uid === "string" ? cleanText(d.device_uid).trim() : "";
+  const fw = typeof d.firmware_version === "string" ? cleanText(d.firmware_version).trim() : "";
   const deviceTime = deviceTimeMs(d);
   const hostTemp = measure(t.host_temp_c);
   const remainingAh = measure(t.remaining_capacity_ah);
@@ -212,6 +223,10 @@ export function parseReading(
 
   return {
     packId,
+    deviceUid: /^[0-9A-Fa-f]{12}$/.test(uid) ? uid.toUpperCase() : null,
+    firmwareVersion: fw ? fw.slice(0, 32) : null,
+    // The firmware sets this explicitly; older builds omit it and fake a clock.
+    timeSynced: d.time_synced === true,
     topic,
     ts: orderingTime(receivedAt, deviceTime, timeOk, replay, clockToleranceS),
     receivedAt,

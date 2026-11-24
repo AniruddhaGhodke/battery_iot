@@ -27,6 +27,7 @@
 
 export type ConfigKey =
   // gateway
+  | "device_id"
   | "can_baud_kbps"
   | "telemetry_interval_ms"
   // BMS protection setpoints
@@ -93,10 +94,27 @@ export type FieldSpec = Common &
     | { kind: "enum"; values: number[] }
     | { kind: "range"; min: number; max: number; step: number }
     | { kind: "bool"; onValue: number; offValue: number }
+    // A string setting. `pattern` and `maxLength` mirror the firmware's own
+    // check, so the dashboard refuses what the device would refuse.
+    | { kind: "text"; pattern: RegExp; maxLength: number; placeholder: string }
   );
 
 export const CONFIG_FIELDS: FieldSpec[] = [
   // ---- gateway -----------------------------------------------------------
+  {
+    key: "device_id",
+    kind: "text",
+    // Mirrors isValidDeviceId in the firmware's configManager.cpp.
+    pattern: /^[A-Za-z0-9_-]{1,31}$/,
+    maxLength: 31,
+    placeholder: "EM_PACK_40S_01",
+    label: "Device name",
+    unit: "",
+    help: "The name this pack reports itself as. Identity is the hardware UID, not this, so renaming keeps all of its history and is how two boards sharing a name are told apart.",
+    group: "gateway",
+    target: "gateway",
+    restarts: false,
+  },
   {
     key: "can_baud_kbps",
     kind: "enum",
@@ -428,7 +446,10 @@ export function sendableFields(): FieldSpec[] {
 
 export const FIELD_GROUPS: FieldGroup[] = ["gateway", "protection", "balancing", "thermal", "commissioning"];
 
-export type ConfigSettings = Partial<Record<ConfigKey, number>>;
+/** Settings are numbers in engineering units, or text for a name. */
+export type ConfigValue = number | string;
+
+export type ConfigSettings = Partial<Record<ConfigKey, ConfigValue>>;
 
 export type Validation =
   | { ok: true; settings: ConfigSettings; restarts: boolean }
@@ -436,6 +457,13 @@ export type Validation =
 
 /** Null when this value is acceptable for the field, otherwise why not. */
 export function fieldError(f: FieldSpec, v: unknown): string | null {
+  if (f.kind === "text") {
+    if (typeof v !== "string") return `${f.label}: must be text`;
+    const s = v.trim();
+    if (!s) return `${f.label}: cannot be empty`;
+    if (s.length > f.maxLength) return `${f.label}: at most ${f.maxLength} characters`;
+    return f.pattern.test(s) ? null : `${f.label}: letters, digits, _ and - only`;
+  }
   if (typeof v !== "number" || !Number.isFinite(v)) return `${f.label}: not a number`;
   if (f.kind === "enum") {
     return f.values.includes(v)
@@ -478,7 +506,7 @@ export function validateSettings(input: unknown): Validation {
     }
     const err = fieldError(f, v);
     if (err) errors.push(err);
-    else settings[f.key] = v as number;
+    else settings[f.key] = f.kind === "text" ? (v as string).trim() : (v as number);
   }
   if (errors.length) return { ok: false, errors };
   return {
@@ -503,6 +531,8 @@ export function staleAfterMs(intervalMs: number | null, defaultMs: number): numb
 export type RequestStatus =
   | "pending"
   | "sent"
+  // OTA only: the device is pulling the image over HTTPS.
+  | "downloading"
   | "restarting"
   | "applied"
   | "rejected"
@@ -512,6 +542,7 @@ export type RequestStatus =
 export const STATUS_LABEL: Record<RequestStatus, string> = {
   pending: "Pending",
   sent: "Sent, waiting for the device",
+  downloading: "Downloading the image",
   restarting: "Reconnecting — waiting for the device",
   applied: "Applied",
   rejected: "Rejected by the device",

@@ -36,6 +36,12 @@ export default async function SettingsPage() {
         </div>
         <nav className="flex items-center gap-2">
           <Link
+            href="/firmware"
+            className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 hover:border-brand-light"
+          >
+            Firmware
+          </Link>
+          <Link
             href="/alerts"
             className="rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink-2 hover:border-brand-light"
           >

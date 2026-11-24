@@ -60,6 +60,22 @@ export const config = {
     controlExpiryMs: int(process.env.CONTROL_EXPIRY_S, 60) * 1000,
     // Refuse to open the channel above this current.
     controlMaxCurrentA: int(process.env.CONTROL_MAX_CURRENT_A, 5),
+
+    // Firmware updates (lib/firmware.ts). The device pulls the image over
+    // HTTPS itself; we only tell it where and what hash to expect.
+    otaCommandTopic: process.env.OTA_COMMAND_TOPIC || "emspl/a7f3c2/{slug}/ota/command",
+    otaStatusTopic: process.env.OTA_STATUS_TOPIC || "emspl/a7f3c2/{slug}/ota/status",
+    // Where the dashboard serves images from. Must be the public HTTPS name:
+    // the device checks the scheme and pins the CA, so an internal address or
+    // an http:// URL is refused before anything is downloaded.
+    firmwareBaseUrl:
+      process.env.FIRMWARE_BASE_URL ||
+      (process.env.SITE_ADDRESS ? `https://${process.env.SITE_ADDRESS}` : ""),
+    // A 1.5 MB image over a weak site connection is slow; the device says
+    // nothing more until it finishes or fails.
+    otaDownloadTimeoutMs: int(process.env.OTA_DOWNLOAD_TIMEOUT_MIN, 15) * 60_000,
+    // After "installed" the board reboots, reconnects and re-syncs its clock.
+    otaRestartGraceMs: int(process.env.OTA_RESTART_GRACE_MIN, 5) * 60_000,
   },
 
   statusPort: int(process.env.STATUS_PORT, 3101),

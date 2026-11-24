@@ -27,6 +27,22 @@ const OPTS = {
   controlAckTopic: "emspl/a7f3c2/{slug}/control/ack",
   controlExpiryMs: 60_000,
   controlMaxCurrentA: 5,
+  otaCommandTopic: "emspl/a7f3c2/{slug}/ota/command",
+  otaStatusTopic: "emspl/a7f3c2/{slug}/ota/status",
+  firmwareBaseUrl: "https://bms.example.com",
+  otaDownloadTimeoutMs: 900_000,
+  otaRestartGraceMs: 300_000,
+};
+
+const IMAGE = {
+  id: 3,
+  version: "1.1.0",
+  sha256: "a".repeat(64),
+  bytes: 1_200_000,
+  originalName: "firmware.bin",
+  notes: null,
+  uploadedBy: "ameya",
+  uploadedAt: 0,
 };
 
 /** Records inserts and updates, and hands back incrementing ids. */
@@ -69,7 +85,9 @@ function manager(over: Partial<{ slug: string | null; fail: string }> = {}) {
   const { sql, log } = fakeSql();
   const m = new ConfigManager(sql, fakeClient(published, over.fail), OPTS, {
     resolve: (deviceId) =>
-      deviceId === "P1" ? { packId: 7, slug: over.slug === undefined ? "pack1" : over.slug } : null,
+      deviceId === "P1"
+        ? { packId: 7, slug: over.slug === undefined ? "pack1" : over.slug, uid: "AABBCCDDEEFF" }
+        : null,
     expectSilence: (pack, until) => silences.push({ pack, until }),
     latest: () => ({ currentA: 0, ageMs: 1000 }),
   });
@@ -156,7 +174,10 @@ describe("submit", () => {
 
     assert.equal(published.length, 1);
     assert.equal(published[0].topic, "emspl/a7f3c2/pack1/config/set");
-    assert.deepEqual(JSON.parse(published[0].payload), { telemetry_interval_ms: 10_000 });
+    assert.deepEqual(JSON.parse(published[0].payload), {
+      target_uid: "AABBCCDDEEFF",
+      telemetry_interval_ms: 10_000,
+    });
     assert.equal(published[0].opts.qos, 1);
     assert.equal(published[0].opts.retain, false, "a retained command would be reapplied on reconnect");
     assert.equal(r.id, 1);
@@ -313,7 +334,7 @@ describe("pending fields", () => {
   it("only exposes the gateway settings as sendable today", () => {
     assert.deepEqual(
       sendableFields().map((f) => f.key),
-      ["can_baud_kbps", "telemetry_interval_ms"],
+      ["device_id", "can_baud_kbps", "telemetry_interval_ms"],
     );
   });
 
@@ -435,7 +456,7 @@ describe("channel control", () => {
       const published: { topic: string; payload: string; opts: { retain?: boolean } }[] = [];
       const { sql } = fakeSql();
       const m = new ConfigManager(sql, fakeClient(published), OPTS, {
-        resolve: () => ({ packId: 7, slug: "pack1" }),
+        resolve: () => ({ packId: 7, slug: "pack1", uid: "AABBCCDDEEFF" }),
         expectSilence: () => {},
         latest: () => ({ currentA: -60, ageMs: 500 }),
       });
@@ -446,6 +467,235 @@ describe("channel control", () => {
       assert.equal(published.length, 0, "nothing may be published when the interlock blocks");
     } finally {
       (spec as { pending: boolean }).pending = wasPending;
+    }
+  });
+});
+
+describe("firmware updates", () => {
+  it("names the target by UID, with an https URL and the image's hash", async () => {
+    const { m, published, silences } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    assert.equal(published.length, 1);
+    assert.equal(published[0].topic, "emspl/a7f3c2/pack1/ota/command");
+    assert.equal(published[0].opts.retain, false, "a retained OTA command would reflash on reconnect");
+    assert.deepEqual(JSON.parse(published[0].payload), {
+      target_uid: "AABBCCDDEEFF",
+      version: "1.1.0",
+      url: `https://bms.example.com/firmware/${IMAGE.sha256}.bin`,
+      sha256: IMAGE.sha256,
+    });
+    assert.equal(req.kind, "ota");
+    // The download blocks the firmware's loop and the reboot follows, so the
+    // pack is quiet for minutes: without this it would be reported offline.
+    assert.equal(silences.length, 1);
+    assert.ok(silences[0].until >= Date.now() + OPTS.otaDownloadTimeoutMs);
+  });
+
+  it("refuses to start without a configured firmware URL", async () => {
+    const { sql } = fakeSql();
+    const m = new ConfigManager(sql, fakeClient([]), { ...OPTS, firmwareBaseUrl: "" }, {
+      resolve: () => ({ packId: 7, slug: "pack1", uid: "AABBCCDDEEFF" }),
+      expectSilence: () => {},
+      latest: () => null,
+    });
+    await assert.rejects(
+      () => m.submitOta("P1", IMAGE, "ameya"),
+      (e: ConfigError) => e.status === 503 && /SITE_ADDRESS/.test(e.message),
+    );
+  });
+
+  it("refuses a URL the device would not fetch", async () => {
+    const { sql } = fakeSql();
+    const m = new ConfigManager(sql, fakeClient([]), { ...OPTS, firmwareBaseUrl: "http://bms.local" }, {
+      resolve: () => ({ packId: 7, slug: "pack1", uid: "AABBCCDDEEFF" }),
+      expectSilence: () => {},
+      latest: () => null,
+    });
+    await assert.rejects(
+      () => m.submitOta("P1", IMAGE, "ameya"),
+      (e: ConfigError) => /HTTPS/.test(e.message),
+    );
+  });
+
+  it("refuses a pack whose hardware UID is unknown", async () => {
+    const { sql } = fakeSql();
+    const published: Published[] = [];
+    const m = new ConfigManager(sql, fakeClient(published), OPTS, {
+      resolve: () => ({ packId: 7, slug: "pack1", uid: null }),
+      expectSilence: () => {},
+      latest: () => null,
+    });
+    for (const send of [
+      () => m.submitOta("P1", IMAGE, "ameya"),
+      () => m.submit("P1", { telemetry_interval_ms: 10_000 }, "ameya"),
+    ]) {
+      await assert.rejects(send, (e: ConfigError) => e.status === 409 && /target_uid/.test(e.message));
+    }
+    assert.equal(published.length, 0, "a command with no target_uid is ignored by every device");
+  });
+
+  it("follows the device from downloading to installed to applied", async () => {
+    const { m, silences } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+
+    m.handleOtaStatus("emspl/a7f3c2/pack1/ota/status", {
+      device_uid: "AABBCCDDEEFF",
+      status: "downloading",
+      version: "1.1.0",
+      current_version: "1.0.0",
+    });
+    assert.equal(req.status, "downloading");
+
+    m.handleOtaStatus("emspl/a7f3c2/pack1/ota/status", {
+      device_uid: "AABBCCDDEEFF",
+      status: "installed",
+      version: "1.1.0",
+    });
+    assert.equal(req.status, "restarting", "flashed is not applied until it comes back");
+
+    // Back, reporting the version we sent.
+    m.onTelemetry("P1", "1.1.0");
+    await settled();
+    assert.equal(req.status, "applied");
+    assert.equal(m.stats.applied, 1);
+    // Normal offline alerting resumes as soon as it is back.
+    assert.ok(silences.at(-1)!.until <= Date.now());
+  });
+
+  it("calls it failed when the pack comes back on the old version", async () => {
+    const { m } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    m.handleOtaStatus("emspl/a7f3c2/pack1/ota/status", {
+      device_uid: "AABBCCDDEEFF",
+      status: "installed",
+      version: "1.1.0",
+    });
+    // A board that fails its own check on boot rolls back and publishes again
+    // as if nothing happened. Only the version tells us.
+    m.onTelemetry("P1", "1.0.0");
+    await settled();
+    assert.equal(req.status, "failed");
+    assert.match(req.error ?? "", /rolled back/);
+  });
+
+  it("does not call an update applied with no version to check", async () => {
+    const { m } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    m.handleOtaStatus("emspl/a7f3c2/pack1/ota/status", {
+      device_uid: "AABBCCDDEEFF",
+      status: "installed",
+      version: "1.1.0",
+    });
+    m.onTelemetry("P1", null);
+    await settled();
+    assert.equal(req.status, "restarting");
+  });
+
+  it("reports what the device said when it refuses", async () => {
+    const { m } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    m.handleOtaStatus("emspl/a7f3c2/pack1/ota/status", {
+      device_uid: "AABBCCDDEEFF",
+      status: "rejected",
+      version: "1.1.0",
+      message: "OTA root CA is not configured in include/otaCredentials.h",
+    });
+    await settled();
+    assert.equal(req.status, "rejected");
+    assert.match(req.error ?? "", /otaCredentials\.h/);
+  });
+
+  it("gives the download minutes, not the acknowledgement timeout", async () => {
+    const { m } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    m.handleOtaStatus("emspl/a7f3c2/pack1/ota/status", {
+      device_uid: "AABBCCDDEEFF",
+      status: "downloading",
+    });
+    m.tick(Date.now() + OPTS.ackTimeoutMs + 1000);
+    assert.equal(req.status, "downloading", "a 1.5 MB download outlasts the ack timeout");
+    m.tick(Date.now() + OPTS.otaDownloadTimeoutMs + 1000);
+    await settled();
+    assert.equal(req.status, "timeout");
+  });
+
+  it("explains a silent timeout, since a bad command is never answered", async () => {
+    const { m } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    m.tick(Date.now() + OPTS.ackTimeoutMs + 1);
+    await settled();
+    assert.equal(req.status, "timeout");
+    assert.match(req.error ?? "", /refused the command without reporting why/);
+  });
+
+  it("will not start a second rollout while one is in flight", async () => {
+    const { m } = manager();
+    await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    await assert.rejects(
+      () => m.submitOta("P1", IMAGE, "ameya"),
+      (e: ConfigError) => e.status === 409 && /still waiting/.test(e.message),
+    );
+    await assert.rejects(
+      () => m.submit("P1", { telemetry_interval_ms: 10_000 }, "ameya"),
+      (e: ConfigError) => e.status === 409,
+    );
+  });
+
+  it("never lets a late write move a finished request backwards", async () => {
+    const { m, log } = manager();
+    await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    // Two updates for one request can be in flight at once — a device on the
+    // same network answers in under a millisecond — and the pool gives no
+    // ordering between connections. Every step but the last is guarded so a
+    // late "sent" cannot overwrite the outcome.
+    const sent = log.find((l) => l.text.startsWith("update config_requests") && l.values.length > 1);
+    assert.ok(sent, log.map((l) => l.text).join("\n"));
+    assert.match(sent.text, /status = any\(/);
+  });
+
+  it("does not mistake a config acknowledgement for an OTA status", async () => {
+    const { m } = manager();
+    const req = await m.submitOta("P1", IMAGE, "ameya");
+    await settled();
+    // Same pack, same moment, a configuration ack arrives: it must not be
+    // matched to the open rollout.
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { device_id: "P1", status: "accepted" });
+    await settled();
+    assert.equal(req.status, "sent");
+  });
+});
+
+describe("renaming a pack", () => {
+  it("matches the acknowledgement that comes back under the new name", async () => {
+    const { m } = manager();
+    const req = await m.submit("P1", { device_id: "EM_PACK_40S_02" }, "ameya");
+    await settled();
+    // The device applies the rename and acknowledges as its new self.
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", {
+      device_id: "EM_PACK_40S_02",
+      status: "accepted",
+      device_id_changed: true,
+    });
+    await settled();
+    assert.equal(req.status, "applied", "the ack is matched on the topic when the name has changed");
+  });
+
+  it("sends the new name as text, within the firmware's own limits", () => {
+    const v = validateSettings({ device_id: "EM_PACK_40S_02" });
+    assert.ok(v.ok);
+    assert.deepEqual(v.settings, { device_id: "EM_PACK_40S_02" });
+    assert.equal(v.restarts, false);
+    for (const bad of ["", "   ", "a b", "pack#1", "x".repeat(32), 42]) {
+      assert.equal(validateSettings({ device_id: bad }).ok, false, JSON.stringify(bad));
     }
   });
 });

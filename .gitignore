@@ -41,5 +41,8 @@ next-env.d.ts
 # ingest bundle
 /dist/
 
+# firmware images uploaded by `npm run dev` (FIRMWARE_DIR)
+/.firmware/
+
 # broker logins (created on the droplet only)
 /deploy/mosquitto/auth/

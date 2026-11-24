@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { StatusChip, when } from "@/components/StatusChip";
 import type { ConfigRequestRow, ConfigurablePack, ControlRequested } from "@/lib/config-data";
 import { CONTROL_ACTIONS, CONTROL_MAX_CURRENT_A } from "@/lib/pack-control";
 import {
@@ -14,40 +15,9 @@ import {
   GROUP_HELP,
   GROUP_LABEL,
   isFinal,
-  STATUS_LABEL,
 } from "@/lib/pack-config";
 
 type Payload = { packs: ConfigurablePack[]; requests: ConfigRequestRow[] };
-
-const STATUS_STYLE: Record<string, string> = {
-  pending: "border-line bg-surface-2 text-ink-2",
-  sent: "border-warn/40 bg-warn-bg text-warn",
-  restarting: "border-warn/40 bg-warn-bg text-warn",
-  applied: "border-brand/40 bg-brand-wash text-brand-dark",
-  rejected: "border-crit/40 bg-crit-bg text-crit",
-  timeout: "border-crit/40 bg-crit-bg text-crit",
-  failed: "border-crit/40 bg-crit-bg text-crit",
-};
-
-function Chip({ status }: { status: string }) {
-  return (
-    <span
-      className={`rounded-md border px-2 py-0.5 text-xs font-medium ${STATUS_STYLE[status] ?? STATUS_STYLE.pending}`}
-    >
-      {STATUS_LABEL[status as keyof typeof STATUS_LABEL] ?? status}
-    </span>
-  );
-}
-
-function when(ms: number): string {
-  return new Intl.DateTimeFormat("en-IN", {
-    day: "numeric",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(ms);
-}
 
 function describe(r: ConfigRequestRow): string {
   if (r.kind === "control") {
@@ -60,6 +30,7 @@ function describe(r: ConfigRequestRow): string {
       const f = FIELD_BY_KEY[k as ConfigKey];
       if (!f) return `${k} ${String(v)}`;
       if (f.kind === "bool") return `${f.label} ${v === f.onValue ? "on" : "off"}`;
+      if (f.kind === "text") return `${f.label} ${String(v)}`;
       return `${f.label} ${Number(v).toLocaleString("en-IN")} ${f.unit}`.trim();
     })
     .join(", ");
@@ -134,6 +105,16 @@ function Field({
               <option value={f.onValue}>On</option>
               <option value={f.offValue}>Off</option>
             </select>
+          ) : f.kind === "text" ? (
+            <input
+              type="text"
+              maxLength={f.maxLength}
+              value={value}
+              onChange={(e) => onValue(e.target.value)}
+              placeholder={f.placeholder}
+              spellCheck={false}
+              className="w-64 rounded-lg border border-line bg-white px-3 py-2 font-mono text-sm text-ink focus:border-brand focus:outline-none"
+            />
           ) : (
             <input
               type="number"
@@ -223,10 +204,10 @@ export function Settings({ initial }: { initial: Payload }) {
         errors.push(`${f.label}: enter a value`);
         continue;
       }
-      const n = Number(raw);
-      const err = fieldError(f, n);
+      const v = f.kind === "text" ? raw.trim() : Number(raw);
+      const err = fieldError(f, v);
       if (err) errors.push(err);
-      else settings[f.key] = n;
+      else settings[f.key] = v;
     }
     if (!Object.keys(settings).length && !errors.length) errors.push("Tick a setting to send.");
     if (errors.length) {
@@ -376,7 +357,7 @@ export function Settings({ initial }: { initial: Payload }) {
           </button>
           {current && (
             <span className="flex items-center gap-2 text-sm text-ink-2">
-              <Chip status={current.status} />
+              <StatusChip status={current.status} />
               {current.error && <span className="text-xs text-ink-3">{current.error}</span>}
             </span>
           )}
@@ -464,7 +445,7 @@ export function Settings({ initial }: { initial: Payload }) {
                     {r.deviceId} · {describe(r)}
                   </span>
                   <span className="flex items-center gap-2">
-                    <Chip status={r.status} />
+                    <StatusChip status={r.status} />
                     <span className="text-xs tabular-nums text-ink-3">{when(r.requestedAt)}</span>
                   </span>
                 </div>

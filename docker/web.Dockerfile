@@ -24,6 +24,10 @@ ENV NODE_ENV=production \
 COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
 COPY --from=build --chown=node:node /app/public ./public
+# Uploaded firmware images (a volume in Compose). Created here and owned by
+# node, because Docker gives a new named volume the image directory's owner —
+# without this the server runs as node and cannot write to a root-owned mount.
+RUN mkdir -p /data/firmware && chown node:node /data/firmware
 USER node
 EXPOSE 3100
 CMD ["node", "server.js"]

@@ -97,6 +97,9 @@ services:
     environment:
       DATABASE_URL: postgres://bms:${POSTGRES_PASSWORD:-bms_local}@db:5432/bms
       INGEST_URL: http://ingest:3101
+      FIRMWARE_DIR: /data/firmware
+    volumes:
+      - firmware:/data/firmware
     depends_on:
       # ingest applies the migrations, so it goes first when it runs. Without
       # it, run `npm run migrate` once on a new database.
@@ -112,3 +115,4 @@ services:
 
 volumes:
   dbdata:
+  firmware:

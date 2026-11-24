@@ -116,6 +116,13 @@ const alertTimer = setInterval(() => {
 const SLUG_INDEX = config.mqttTopic.split("/").indexOf("+");
 const ACK_SUBSCRIPTION = subscriptionFor(config.remoteConfig.ackTopic);
 const CONTROL_ACK_SUBSCRIPTION = subscriptionFor(config.remoteConfig.controlAckTopic);
+const OTA_STATUS_SUBSCRIPTION = subscriptionFor(config.remoteConfig.otaStatusTopic);
+const SUBSCRIPTIONS = [
+  config.mqttTopic,
+  ACK_SUBSCRIPTION,
+  CONTROL_ACK_SUBSCRIPTION,
+  OTA_STATUS_SUBSCRIPTION,
+];
 
 /** Does this topic match a "prefix{slug}suffix" template? */
 function matchesTemplate(template: string, topic: string): boolean {
@@ -129,6 +136,11 @@ function isAckTopic(topic: string): boolean {
     matchesTemplate(config.remoteConfig.ackTopic, topic) ||
     matchesTemplate(config.remoteConfig.controlAckTopic, topic)
   );
+}
+
+/** A firmware-update progress topic. */
+function isOtaStatusTopic(topic: string): boolean {
+  return matchesTemplate(config.remoteConfig.otaStatusTopic, topic);
 }
 
 let configs: ConfigManager | undefined;
@@ -168,11 +180,12 @@ function store(packId: number | null, reading: Reading) {
   msgStats.accepted++;
   notifier.observe(reading);
   lastReading.set(reading.packId, { currentA: reading.current, at: Date.now() });
+  packs.noteIdentity(reading.packId, reading.deviceUid, reading.firmwareVersion, reading.timeSynced);
   if (SLUG_INDEX >= 0) {
     const slug = reading.topic.split("/")[SLUG_INDEX];
     if (slug) packs.noteTopic(reading.packId, slug);
   }
-  configs?.onTelemetry(reading.packId);
+  configs?.onTelemetry(reading.packId, reading.firmwareVersion);
 }
 
 function handleMessage(topic: string, payload: Buffer) {
@@ -196,6 +209,10 @@ function handleMessage(topic: string, payload: Buffer) {
     configs?.handleAck(topic, doc);
     return;
   }
+  if (isOtaStatusTopic(topic)) {
+    configs?.handleOtaStatus(topic, doc);
+    return;
+  }
   const deviceId =
     doc && typeof doc === "object" && !Array.isArray(doc)
       ? (doc as Record<string, unknown>).device_id
@@ -205,7 +222,14 @@ function handleMessage(topic: string, payload: Buffer) {
     return;
   }
 
-  const id = packs.lookup(deviceId);
+  // The hardware UID identifies the board; device_id is a label it can be
+  // told to change. Resolve on the UID where the firmware sends one.
+  const rawUid = (doc as Record<string, unknown>).device_uid;
+  const uid = typeof rawUid === "string" && /^[0-9A-Fa-f]{12}$/.test(rawUid.trim())
+    ? rawUid.trim().toUpperCase()
+    : null;
+
+  const id = packs.lookupByIdentity(deviceId, uid);
   if (id === null) {
     msgStats.rejected.notAllowed++;
     return;
@@ -239,7 +263,7 @@ client.on("connect", (ack) => {
   mqttStats.lastError = null;
   // With a resumed session the broker remembers the subscription, but
   // subscribing again is harmless and covers a changed MQTT_TOPIC.
-  client.subscribe([config.mqttTopic, ACK_SUBSCRIPTION, CONTROL_ACK_SUBSCRIPTION], { qos: 1 }, (err, granted) => {
+  client.subscribe(SUBSCRIPTIONS, { qos: 1 }, (err, granted) => {
     if (err) mqttStats.lastError = `subscribe failed: ${err.message}`;
     else {
       const refused = granted?.filter((g) => g.qos === 128).map((g) => g.topic) ?? [];
@@ -251,7 +275,7 @@ client.on("connect", (ack) => {
   });
   console.log(
     `[mqtt] connected to ${config.mqttUrl} as ${config.mqttClientId}` +
-      `${ack.sessionPresent ? " (resumed session)" : ""}, subscribed to ${config.mqttTopic}, ${ACK_SUBSCRIPTION} and ${CONTROL_ACK_SUBSCRIPTION}`,
+      `${ack.sessionPresent ? " (resumed session)" : ""}, subscribed to ${SUBSCRIPTIONS.join(", ")}`,
   );
 });
 client.on("close", () => {
@@ -387,8 +411,62 @@ async function postControl(req: http.IncomingMessage, res: http.ServerResponse) 
   }
 }
 
+/**
+ * POST /ota — start a firmware update. The body names an uploaded image by
+ * id; its version and hash are read here rather than taken from the caller,
+ * so a rollout can only ever install a file the server actually has.
+ */
+async function postOta(req: http.IncomingMessage, res: http.ServerResponse) {
+  try {
+    const body = (await readJson(req)) as Record<string, unknown>;
+    const deviceId = typeof body.device_id === "string" ? body.device_id.trim() : "";
+    if (!deviceId) throw new ConfigError("device_id is required", 400);
+    const firmwareId = Number(body.firmware_id);
+    if (!Number.isInteger(firmwareId) || firmwareId <= 0) {
+      throw new ConfigError("firmware_id is required", 400);
+    }
+    if (!configs) throw new ConfigError("ingest is still starting up", 503);
+    const by =
+      typeof body.requested_by === "string" && body.requested_by.trim()
+        ? body.requested_by.trim().slice(0, 100)
+        : "unknown";
+
+    const rows = await sql<
+      { id: string; version: string; sha256: string; bytes: string }[]
+    >`select id, version, sha256, bytes from firmware_images where id = ${firmwareId}`;
+    if (!rows.length) throw new ConfigError(`no firmware image with id ${firmwareId}`, 404);
+    const image = {
+      id: Number(rows[0].id),
+      version: rows[0].version,
+      sha256: rows[0].sha256,
+      bytes: Number(rows[0].bytes),
+      originalName: null,
+      notes: null,
+      uploadedBy: "",
+      uploadedAt: 0,
+    };
+
+    const r = await configs.submitOta(deviceId, image, by);
+    json(res, 202, {
+      id: r.id,
+      device_id: r.deviceId,
+      status: r.status,
+      kind: r.kind,
+      version: r.firmware?.version ?? null,
+    });
+  } catch (e) {
+    if (e instanceof ConfigError) json(res, e.status, { error: e.message, details: e.details });
+    else {
+      console.warn(`[ota] request failed: ${(e as Error).message}`);
+      json(res, 500, { error: (e as Error).message });
+    }
+  }
+}
+
 const server = http.createServer((req, res) => {
-  if (req.method === "POST" && req.url === "/control") {
+  if (req.method === "POST" && req.url === "/ota") {
+    void postOta(req, res);
+  } else if (req.method === "POST" && req.url === "/control") {
     void postControl(req, res);
   } else if (req.method === "POST" && req.url === "/config") {
     void postConfig(req, res);

@@ -2,6 +2,7 @@
 
 import { config } from "./config";
 import { sql } from "./db";
+import type { OtaRequested } from "./firmware";
 import { type ConfigSettings, type RequestStatus, staleAfterMs } from "./pack-config";
 
 export type ConfigurablePack = {
@@ -10,6 +11,12 @@ export type ConfigurablePack = {
   site: string | null;
   /** The topic segment it publishes on. Null until it has sent telemetry. */
   topicSlug: string | null;
+  /** The board's hardware UID. Commands cannot be addressed without it. */
+  deviceUid: string | null;
+  /** The firmware version it last reported. */
+  firmwareVersion: string | null;
+  /** False when its clock is not NTP-synced. */
+  timeSynced: boolean | null;
   /** The interval we last set, if any. */
   telemetryIntervalMs: number | null;
   lastSeen: number | null;
@@ -22,8 +29,8 @@ export type ControlRequested = { action: string; value: string };
 export type ConfigRequestRow = {
   id: number;
   deviceId: string;
-  kind: "config" | "control";
-  requested: ConfigSettings | ControlRequested;
+  kind: "config" | "control" | "ota";
+  requested: ConfigSettings | ControlRequested | OtaRequested;
   status: RequestStatus;
   requestedBy: string;
   requestedAt: number;
@@ -31,6 +38,8 @@ export type ConfigRequestRow = {
   ackedAt: number | null;
   ack: unknown;
   error: string | null;
+  /** OTA only: which image it is installing. */
+  firmwareId: number | null;
 };
 
 export async function listConfigurablePacks(): Promise<ConfigurablePack[]> {
@@ -40,6 +49,9 @@ export async function listConfigurablePacks(): Promise<ConfigurablePack[]> {
       label: string | null;
       site: string | null;
       topicSlug: string | null;
+      deviceUid: string | null;
+      firmwareVersion: string | null;
+      timeSynced: boolean | null;
       telemetryIntervalMs: number | null;
       lastSeen: string | null;
     }[]
@@ -48,6 +60,9 @@ export async function listConfigurablePacks(): Promise<ConfigurablePack[]> {
            p.label,
            p.site,
            p.topic_slug                                       as "topicSlug",
+           p.device_uid                                       as "deviceUid",
+           p.firmware_version                                 as "firmwareVersion",
+           p.time_synced                                      as "timeSynced",
            p.telemetry_interval_ms                            as "telemetryIntervalMs",
            (extract(epoch from l.received_at) * 1000)::bigint::text as "lastSeen"
       from packs p
@@ -74,12 +89,13 @@ export async function listConfigRequests(limit = 20, deviceId?: string): Promise
       id: string;
       deviceId: string;
       kind: string;
-      requested: ConfigSettings | ControlRequested;
+      requested: ConfigSettings | ControlRequested | OtaRequested;
       status: string;
       requestedBy: string;
       requestedAt: Date;
       sentAt: Date | null;
       ackedAt: Date | null;
+      firmwareId: string | null;
       ack: unknown;
       error: string | null;
     }[]
@@ -87,6 +103,7 @@ export async function listConfigRequests(limit = 20, deviceId?: string): Promise
     select id,
            device_id    as "deviceId",
            kind,
+           firmware_id  as "firmwareId",
            requested,
            status,
            requested_by as "requestedBy",
@@ -102,7 +119,8 @@ export async function listConfigRequests(limit = 20, deviceId?: string): Promise
   return rows.map((r) => ({
     ...r,
     id: Number(r.id),
-    kind: r.kind === "control" ? "control" : "config",
+    kind: r.kind === "control" ? "control" : r.kind === "ota" ? "ota" : "config",
+    firmwareId: r.firmwareId === null ? null : Number(r.firmwareId),
     status: r.status as RequestStatus,
     requestedAt: r.requestedAt.getTime(),
     sentAt: r.sentAt?.getTime() ?? null,

@@ -176,6 +176,12 @@ payload unchanged (schema 2, see [Payload](#payload)).
 | `CONTROL_SET_TOPIC` / `CONTROL_ACK_TOPIC` | `emspl/a7f3c2/{slug}/control/set` / `…/ack` | Channel control topics, deliberately separate from configuration |
 | `CONTROL_EXPIRY_S` | 60 | A control command the firmware receives after this must be ignored |
 | `CONTROL_MAX_CURRENT_A` | 5 | The channel is not opened above this current |
+| `OTA_COMMAND_TOPIC` / `OTA_STATUS_TOPIC` | `emspl/a7f3c2/{slug}/ota/command` / `…/status` | Firmware update topics |
+| `SITE_ADDRESS` | empty | Public HTTPS name. **Ingest needs it too**: it is the URL packs download firmware from |
+| `FIRMWARE_BASE_URL` | from `SITE_ADDRESS` | Override if images are served from somewhere else |
+| `FIRMWARE_DIR` | `/data/firmware` | Where uploaded images are stored (`.firmware` outside production) |
+| `OTA_DOWNLOAD_TIMEOUT_MIN` | 15 | How long a pack may spend downloading an image |
+| `OTA_RESTART_GRACE_MIN` | 5 | How long it may take to come back after flashing |
 | `ALERT_TIMEZONE` / `ALERT_TIMEZONE_LABEL` | `Asia/Kolkata` / `IST` | Times in messages |
 
 Restart ingest after editing `.env.local` (`docker compose up -d` or the
@@ -328,12 +334,45 @@ browser ──► /api/config (web) ──HTTP──► ingest ──MQTT──�
 |---|---|
 | Configuration command (ingest publishes) | `emspl/a7f3c2/<slug>/config/set` |
 | Acknowledgement (device publishes) | `emspl/a7f3c2/<slug>/config/ack` |
+| Channel control (ingest publishes) | `emspl/a7f3c2/<slug>/control/set` |
+| Control acknowledgement (device publishes) | `emspl/a7f3c2/<slug>/control/ack` |
+| Firmware update (ingest publishes) | `emspl/a7f3c2/<slug>/ota/command` |
+| Update progress (device publishes) | `emspl/a7f3c2/<slug>/ota/status` |
 | Telemetry (existing) | `emspl/a7f3c2/<slug>/data` |
 
 `<slug>` is the pack's own topic segment. It is **learned from the telemetry
 topic**, not configured by hand: the first reading from a pack records it in
 `packs.topic_slug`. A pack that has never published cannot be configured, and
 the settings page says so.
+
+### Which device a command is for
+
+The topic does not identify the pack. Every board the firmware has shipped so
+far publishes on `emspl/a7f3c2/pack1/...` — the segment is hardcoded — so a
+command on that topic reaches all of them. What separates them is
+**`target_uid`**, a 12-hex-digit id the firmware derives from the ESP32's
+eFuse MAC:
+
+```json
+{ "target_uid": "AABBCCDDEEFF", "telemetry_interval_ms": 30000 }
+```
+
+Each board compares it against its own UID and ignores anything that does not
+match (`commandTargetsThisDevice` in the firmware's `main.cpp`). **Ingest puts
+it on every command** — configuration, control and OTA. A command without it
+is dropped by every pack and nothing is published back, so it looks exactly
+like a device that is not listening.
+
+The UID is therefore the pack's real identity, and `device_id` is only a label:
+
+- It arrives in each payload as `device_uid` and is stored in `packs.device_uid`
+  (unique). Readings are matched on it first, so a board that is renamed stays
+  the same pack and keeps its history.
+- A pack that has not reported one **cannot be sent anything**, and the pages
+  say so. The firmware build running on a pack today may not send it; the first
+  update to a build that does has to go on over USB.
+- `device_id` is itself settable (below), which is how two boards that shipped
+  with the same name are told apart without touching the hardware.
 
 ### Settings
 
@@ -346,8 +385,15 @@ ingest validates every request again.
 
 | Key | Values | Restarts |
 |---|---|---|
+| `device_id` | 1–31 of `A–Z a–z 0–9 _ -` | no |
 | `can_baud_kbps` | 250 only | yes |
 | `telemetry_interval_ms` | 1,000–300,000 ms | no |
+
+Renaming a pack with `device_id` changes only its label. The board keeps its
+UID, so its readings keep going to the same row and its history is intact; the
+packs table follows the new name on the next reading. The acknowledgement comes
+back under the **new** name, which is why an ack is also matched on the topic
+it arrived on.
 
 250 is the only bitrate offered. The 192S protocol runs at 250 kHz and has no
 bitrate command, so 500 would silence the BMS link; the field is kept only so
@@ -474,6 +520,7 @@ is the contract. On `emspl/a7f3c2/<slug>/config/ack`:
 |---|---|
 | `pending` | Accepted by the server, not yet published |
 | `sent` | The broker accepted the publish — **not** proof the device applied it |
+| `downloading` | OTA only: the pack is pulling the image over HTTPS |
 | `restarting` | Acknowledged; waiting for the pack to come back |
 | `applied` | Acknowledged, and for a restart telemetry has resumed |
 | `rejected` | The device refused it, with its reason |
@@ -492,10 +539,12 @@ would be redelivered and reapplied every time a device reconnected.
 
 ### Broker access
 
-`deploy/mosquitto/acl` grants `bms-ingest` write on `+/config/set` and read on
-`+/config/ack`, and the device account the mirror of that. Ingest is the only
-client permitted to write `config/set`, which is what stops anything else
-reconfiguring a pack. After changing the ACL:
+`deploy/mosquitto/acl` grants `bms-ingest` write on `+/config/set`,
+`+/control/set` and `+/ota/command`, and read on the three the device answers
+on; the device account is the mirror of that. Ingest is the only client
+permitted to write those three, which is what stops anything else
+reconfiguring, switching or reflashing a pack. They are separate entries so
+the three permissions can be separated later. After changing the ACL:
 
 ```bash
 docker compose restart mosquitto
@@ -534,10 +583,98 @@ The page moves to Applied within a couple of seconds.
   firmware does not expose them over MQTT yet. `lib/pack-config.ts` is where
   they are added once it does.
 
+## Firmware updates (OTA)
+
+**/firmware** (linked from the settings header) uploads a build and installs it
+on one pack. The image is not sent over MQTT: the pack is told where to fetch
+it and what it must hash to, and downloads it itself.
+
+```
+browser ──► /api/firmware  upload, hashed and stored as <sha256>.bin
+browser ──► /api/ota ──► ingest ──MQTT──► emspl/a7f3c2/<slug>/ota/command
+                                 ◄──MQTT─ emspl/a7f3c2/<slug>/ota/status
+pack    ──HTTPS──► https://<SITE_ADDRESS>/firmware/<sha256>.bin
+```
+
+The command is exactly what the firmware checks for:
+
+```json
+{
+  "target_uid": "AABBCCDDEEFF",
+  "version": "1.1.0",
+  "url": "https://bms.example.com/firmware/<64 hex>.bin",
+  "sha256": "<64 hex>"
+}
+```
+
+### How an update is verified
+
+The file name **is** its SHA-256, computed from the bytes as uploaded. The same
+hash goes in the command, so the dashboard cannot serve one file and promise
+another. The pack hashes what it actually wrote to flash and refuses to boot a
+mismatch, and the upload is rejected here if it does not start with `0xE9` (an
+ESP32 image) or will not fit the 1.9 MB OTA partition — which catches the
+`.elf` or the wrong `firmware.bin` before a pack erases a partition for it.
+
+Nothing is "applied" until the pack comes back **reporting the version that was
+sent**. A build that fails its own check on boot rolls back to the previous one
+and publishes again as if nothing happened; comparing `firmware_version` is the
+only thing that tells those two apart, and a rollback is reported as `failed`.
+
+### Serving the image
+
+Images live in a Docker volume (`firmware`), written by `web` and served by
+Caddy from `/firmware/*.bin` **outside basic auth** — the ESP32 cannot send
+credentials. Only `<64 hex>.bin` is ever written there, so a name has to be an
+image's own hash to exist at all: the URL is the capability. There is no
+listing, and nothing else is served from that path.
+
+`SITE_ADDRESS` is passed to **ingest** as well as Caddy, because ingest is what
+puts the URL in the command. The device requires `https://` and at most 255
+characters, so an internal address will not do.
+
+### Before the first update
+
+Two things on the firmware side, neither of which the server can do:
+
+1. **`include/otaCredentials.h` is empty.** `OTA_ROOT_CA_CERT` has no
+   certificate in it, and `otaService.cpp` refuses every update while that is
+   true — it publishes `rejected` with "OTA root CA is not configured", which
+   this page shows verbatim. Paste in the PEM root CA for the dashboard's
+   certificate (Let's Encrypt: ISRG Root X1) and flash once over USB.
+2. **The first update per board must go on over USB.** A board running a build
+   that does not send `device_uid` cannot be addressed by `target_uid`, so it
+   cannot be reached over the air at all.
+
+Also worth knowing: downloads are **Wi-Fi only** in this firmware release. A
+pack on the cellular backup keeps the command and waits for Wi-Fi.
+
+### Timings
+
+A download is minutes, not seconds, and the pack stops publishing for the whole
+of it — the download blocks the firmware's main loop and the restart follows.
+Ingest tells the alert engine to expect that silence, so no "pack offline"
+message goes to WhatsApp for an update in progress. If the update fails, normal
+alerting resumes within a minute.
+
+| Setting | Default | What it covers |
+|---|---|---|
+| `CONFIG_ACK_TIMEOUT_S` | 20 | Waiting for the first word from the device |
+| `OTA_DOWNLOAD_TIMEOUT_MIN` | 15 | The download itself |
+| `OTA_RESTART_GRACE_MIN` | 5 | Reboot, reconnect, clock sync |
+
+A malformed command is the one case with no reply at all: the firmware only
+writes the reason to its own console. The request then ends as `timeout`, and
+says so.
+
 ## API
 
 | Route | Returns |
 |---|---|
+| `GET /api/firmware` | Uploaded images and recent rollouts |
+| `POST /api/firmware` | Stores an image (multipart: `image`, `version`, `notes`) |
+| `POST /api/ota` | Starts an update: `{device_id, firmware_id}` |
+| `GET /firmware/<sha256>.bin` | The image itself, for a device (no auth) |
 | `GET /api/status` | Ingest (broker link, message counters, rejections, write buffer), database health and size |
 | `GET /api/alerts?limit=&pack=` | Alert history with the cause analysis, plus what is raised right now |
 | `GET /api/alerts/:id` | One alert and its full report |

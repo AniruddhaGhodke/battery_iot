@@ -7,9 +7,20 @@
 {$SITE_ADDRESS} {
 	encode zstd gzip
 
-	basic_auth {
-		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	# Firmware images, served straight from the shared volume with no basic
+	# auth: the ESP32 downloads these itself and cannot send credentials.
+	# Only "<64 hex>.bin" is ever written there by the dashboard, so a name
+	# has to be an image's own SHA-256 to exist at all — the URL is the
+	# capability. No directory listing, nothing else under this path.
+	handle /firmware/*.bin {
+		root * /srv
+		file_server
 	}
 
-	reverse_proxy web:3100
+	handle {
+		basic_auth {
+			{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+		}
+		reverse_proxy web:3100
+	}
 }

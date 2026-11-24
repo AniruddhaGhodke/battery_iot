@@ -13,4 +13,9 @@ export const config = {
   // Must match the retention policy in db/migrations (raw rows older than
   // this are gone; history falls back to the roll-ups).
   rawRetentionDays: int(process.env.RAW_RETENTION_DAYS, 90),
+  // Where uploaded firmware images are kept. A Docker volume shared with
+  // Caddy, which serves them to devices; see deploy/docker-compose.yml. The
+  // local default keeps `npm run dev` out of the container's paths.
+  firmwareDir:
+    process.env.FIRMWARE_DIR || (process.env.NODE_ENV === "production" ? "/data/firmware" : ".firmware"),
 };

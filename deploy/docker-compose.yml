@@ -80,6 +80,9 @@ services:
     environment:
       DATABASE_URL: postgres://bms:${POSTGRES_PASSWORD}@db:5432/bms
       STATUS_PORT: "3101"
+      # Where packs download firmware from. The device requires HTTPS and
+      # pins the CA, so this has to be the public name, not a container one.
+      SITE_ADDRESS: ${SITE_ADDRESS}
     depends_on:
       db:
         condition: service_healthy
@@ -102,6 +105,10 @@ services:
     environment:
       DATABASE_URL: postgres://bms:${POSTGRES_PASSWORD}@db:5432/bms
       INGEST_URL: http://ingest:3101
+      FIRMWARE_DIR: /data/firmware
+    volumes:
+      # Uploaded firmware images. Caddy serves the same volume read-only.
+      - firmware:/data/firmware
     depends_on:
       # ingest applies the migrations, so it must be up first.
       ingest:
@@ -123,6 +130,8 @@ services:
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Served at /firmware/*.bin, outside basic auth (see the Caddyfile).
+      - firmware:/srv/firmware:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -132,6 +141,7 @@ services:
 
 volumes:
   dbdata:
+  firmware:
   mosquitto_data:
   caddy_data:
   caddy_config:

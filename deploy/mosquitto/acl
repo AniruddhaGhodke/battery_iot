@@ -10,6 +10,8 @@ topic write emspl/a7f3c2/+/config/ack
 topic read emspl/a7f3c2/+/config/set
 topic write emspl/a7f3c2/+/control/ack
 topic read emspl/a7f3c2/+/control/set
+topic write emspl/a7f3c2/+/ota/status
+topic read emspl/a7f3c2/+/ota/command
 
 # The ingest worker: read telemetry and acknowledgements, and publish
 # configuration. It is the only client allowed to write config/set, which is
@@ -25,3 +27,8 @@ topic write emspl/a7f3c2/+/config/set
 # drop the next two lines to leave ingest able to configure but not switch.
 topic read emspl/a7f3c2/+/control/ack
 topic write emspl/a7f3c2/+/control/set
+# Firmware updates, again on their own topic: ota/command carries only a URL
+# and a hash, so the ability to start a rollout can be separated from the
+# ability to change settings (README, "Firmware updates").
+topic read emspl/a7f3c2/+/ota/status
+topic write emspl/a7f3c2/+/ota/command
