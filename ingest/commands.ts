@@ -318,7 +318,12 @@ export class ConfigManager {
     let req = s.deviceUid
       ? (open.find((r) => this.deps.resolve(r.deviceId)?.uid === s.deviceUid) ?? null)
       : null;
-    if (!req) req = open.find((r) => this.topicMatches(r, topic)) ?? null;
+    if (!req) {
+      // Same caution as an ack with an unknown device: one pack's topic is
+      // every pack's topic.
+      const byTopic = open.filter((r) => this.topicMatches(r, topic));
+      req = byTopic.length === 1 ? byTopic[0] : null;
+    }
     if (!req) {
       console.warn(`[ota] unmatched status on ${topic}: ${JSON.stringify(doc).slice(0, 200)}`);
       return;
@@ -612,12 +617,23 @@ export class ConfigManager {
       return r && !isFinal(r.status) ? r : null;
     }
     // No request id in the payload: fall back to the device by name, then to
-    // the topic it answered on, and take its oldest outstanding request. The
-    // topic fallback matters for a rename: the device acknowledges under its
-    // new name, which is not the name the request was sent to.
+    // the topic it answered on. The topic fallback matters for a rename: the
+    // device acknowledges under its new name, which is not the name the
+    // request was sent to. Packs share a topic, though, so that fallback is
+    // only safe when one request is open on it — with two it would be a coin
+    // toss, and marking the wrong pack applied is worse than matching none.
     const open = [...this.open.values()].filter((r) => r.kind !== "ota" && !isFinal(r.status));
     let candidates = ack.deviceId ? open.filter((r) => r.deviceId === ack.deviceId) : [];
-    if (!candidates.length) candidates = open.filter((r) => this.topicMatches(r, topic));
+    if (!candidates.length) {
+      const byTopic = open.filter((r) => this.topicMatches(r, topic));
+      if (byTopic.length > 1) {
+        console.warn(
+          `[config] ${byTopic.length} requests are open on ${topic} and this acknowledgement names no device we know; leaving it unmatched`,
+        );
+        return null;
+      }
+      candidates = byTopic;
+    }
     candidates.sort((a, b) => a.requestedAt - b.requestedAt);
     return candidates[0] ?? null;
   }

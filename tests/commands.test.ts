@@ -689,6 +689,26 @@ describe("renaming a pack", () => {
     assert.equal(req.status, "applied", "the ack is matched on the topic when the name has changed");
   });
 
+  it("refuses to guess when two packs share a topic", async () => {
+    const { sql } = fakeSql();
+    const published: Published[] = [];
+    // Two boards, one hardcoded topic — which is how the firmware ships.
+    const m = new ConfigManager(sql, fakeClient(published), OPTS, {
+      resolve: (d: string) => ({ packId: d === "P1" ? 7 : 8, slug: "pack1", uid: `AABBCCDDEE0${d.at(-1)}` }),
+      expectSilence: () => {},
+      latest: () => null,
+    });
+    const a = await m.submit("P1", { device_id: "RENAMED_1" }, "ameya");
+    const b = await m.submit("P2", { device_id: "RENAMED_2" }, "ameya");
+    await settled();
+    // An ack under a name we have never seen: it belongs to one of the two
+    // renames and there is no way to tell which.
+    m.handleAck("emspl/a7f3c2/pack1/config/ack", { device_id: "RENAMED_1", status: "accepted" });
+    await settled();
+    assert.equal(a.status, "sent");
+    assert.equal(b.status, "sent");
+  });
+
   it("sends the new name as text, within the firmware's own limits", () => {
     const v = validateSettings({ device_id: "EM_PACK_40S_02" });
     assert.ok(v.ok);
