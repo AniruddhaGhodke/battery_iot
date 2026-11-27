@@ -2,6 +2,7 @@
 
 import { config } from "./config";
 import { sql } from "./db";
+import type { ReportedSetpoints } from "./bms-setpoints";
 import type { OtaRequested } from "./firmware";
 import { type ConfigSettings, type RequestStatus, staleAfterMs } from "./pack-config";
 
@@ -17,6 +18,9 @@ export type ConfigurablePack = {
   firmwareVersion: string | null;
   /** False when its clock is not NTP-synced. */
   timeSynced: boolean | null;
+  /** The limits the BMS reports for itself, as raw counts. */
+  bmsSetpoints: ReportedSetpoints | null;
+  bmsSetpointsAt: number | null;
   /** The interval we last set, if any. */
   telemetryIntervalMs: number | null;
   lastSeen: number | null;
@@ -52,6 +56,8 @@ export async function listConfigurablePacks(): Promise<ConfigurablePack[]> {
       deviceUid: string | null;
       firmwareVersion: string | null;
       timeSynced: boolean | null;
+      bmsSetpoints: ReportedSetpoints | null;
+      bmsSetpointsAt: Date | null;
       telemetryIntervalMs: number | null;
       lastSeen: string | null;
     }[]
@@ -63,6 +69,8 @@ export async function listConfigurablePacks(): Promise<ConfigurablePack[]> {
            p.device_uid                                       as "deviceUid",
            p.firmware_version                                 as "firmwareVersion",
            p.time_synced                                      as "timeSynced",
+           p.bms_setpoints                                    as "bmsSetpoints",
+           p.bms_setpoints_at                                 as "bmsSetpointsAt",
            p.telemetry_interval_ms                            as "telemetryIntervalMs",
            (extract(epoch from l.received_at) * 1000)::bigint::text as "lastSeen"
       from packs p
@@ -74,6 +82,7 @@ export async function listConfigurablePacks(): Promise<ConfigurablePack[]> {
     const lastSeen = r.lastSeen === null ? null : Number(r.lastSeen);
     return {
       ...r,
+      bmsSetpointsAt: r.bmsSetpointsAt?.getTime() ?? null,
       lastSeen,
       online:
         lastSeen !== null &&

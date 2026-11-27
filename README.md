@@ -400,9 +400,26 @@ bitrate command, so 500 would silence the BMS link; the field is kept only so
 a pack can be put back if it is ever mis-set by other means.
 
 **Defined but not sendable yet** — the BMS accepts all of these on CAN id
-`0xF4`, but the gateway firmware does not forward them from MQTT. They are
-listed so the values and limits can be agreed before firmware work starts, and
+`0xF4`, but two things have to be settled before the dashboard writes one.
+The gateway has to forward them from MQTT; and the units have to be known.
 `validateSettings` refuses them until the `pending` flag is cleared.
+
+The units are the harder of the two. Each command is three bytes — a header
+and a 16-bit value — and the protocol document (V9.8, page 19) gives units
+for 3 of its 28 commands. Nothing in it says whether a current limit is amps
+or tenths of an amp, and the document and the working firmware already
+disagree about two telemetry fields: group 4's "battery capacity percentage"
+is decoded as remaining amp-hours, and group 5's "remaining capacity" as
+state of charge. A protection limit written ten times too high is an
+over-current trip that never trips, so none of this is inferred.
+
+What settles it is the BMS itself. It broadcasts its own configuration in
+sending groups 1, 2, 5 and 6, and the gateway now forwards those numbers
+**unscaled** as `bms_setpoints_raw`. Ingest stores the latest set on
+`packs.bms_setpoints` (written only when it changes, since it is
+configuration arriving with every reading) and /settings shows each raw count
+beside its field. Comparing one against the value on the BMS's own display
+fixes that field's scale; see `lib/bms-setpoints.ts`.
 
 | Key | CAN | Range | Group |
 |---|---|---|---|

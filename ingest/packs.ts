@@ -6,6 +6,7 @@
  * take effect without a restart.
  */
 
+import { type ReportedSetpoints, setpointsDiffer } from "../lib/bms-setpoints.ts";
 import type { Sql } from "postgres";
 
 type Entry = {
@@ -26,6 +27,8 @@ export class PackRegistry {
   private registering = new Map<string, Promise<Entry | null>>();
   /** Last firmware version written per pack, so we only write on a change. */
   private lastFirmware = new Map<number, string | null>();
+  /** Last setpoints written per pack, so an unchanged set is not rewritten. */
+  private lastSetpoints = new Map<number, ReportedSetpoints>();
   private timer: NodeJS.Timeout | null = null;
   /** Rejected device_ids, for /status. Capped so a flood can't grow it. */
   readonly unknown = new Map<string, { count: number; lastSeen: number }>();
@@ -129,6 +132,29 @@ export class PackRegistry {
         if (firstTime) console.log(`[packs] ${deviceId} has hardware uid ${uid}`);
       })
       .catch((e) => console.warn(`[packs] could not record identity: ${(e as Error).message}`));
+  }
+
+  /**
+   * Records the limits the BMS reports for itself. Written only when they
+   * change: they are configuration, not telemetry, and arrive with every
+   * reading. See lib/bms-setpoints.ts for why they are stored unscaled.
+   */
+  noteSetpoints(deviceId: string, setpoints: ReportedSetpoints | null) {
+    if (!setpoints) return;
+    const e = this.byDevice.get(deviceId);
+    if (!e) return;
+    const last = this.lastSetpoints.get(e.id) ?? null;
+    if (!setpointsDiffer(last, setpoints)) return;
+    this.lastSetpoints.set(e.id, setpoints);
+    this.sql`
+      update packs
+         set bms_setpoints = ${this.sql.json(setpoints as never)}, bms_setpoints_at = now()
+       where id = ${e.id}`
+      .then(() => console.log(`[packs] ${deviceId} reports setpoints ${JSON.stringify(setpoints)}`))
+      .catch((err) => {
+        this.lastSetpoints.delete(e.id); // try again on the next reading
+        console.warn(`[packs] could not record setpoints for ${deviceId}: ${(err as Error).message}`);
+      });
   }
 
   /**

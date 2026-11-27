@@ -208,3 +208,55 @@ describe("Writer", () => {
     assert.equal(w.stats.lastError, null);
   });
 });
+
+describe("BMS setpoints the pack reports", () => {
+  it("passes the raw counts through without scaling them", () => {
+    const r = parseReading(
+      payload({
+        bms_setpoints_raw: {
+          groups_seen: 15,
+          over_discharge: 2500,
+          over_current: 1000,
+          pack_capacity: 2610,
+          series_count: 40,
+          over_charge: 3650,
+          over_temperature: 55,
+          charge_recovery: 3400,
+          discharge_recovery: 2800,
+          balance_start: 3400,
+        },
+      }),
+      "P",
+      "t",
+      NOW,
+    );
+    // Deliberately unconverted: nothing we have says whether over_current is
+    // 1000 A or 100.0 A, and guessing wrong disables the trip.
+    assert.equal(r.bmsSetpoints?.over_current, 1000);
+    assert.equal(r.bmsSetpoints?.over_discharge, 2500);
+    assert.equal(r.bmsSetpoints?.series_count, 40);
+    // groups_seen is the firmware's own bookkeeping, not a setpoint.
+    assert.equal("groups_seen" in (r.bmsSetpoints ?? {}), false);
+  });
+
+  it("is null when the pack sends none, so a gap never reads as a limit of zero", () => {
+    assert.equal(parseReading(payload(), "P", "t", NOW).bmsSetpoints, null);
+    assert.equal(parseReading(payload({ bms_setpoints_raw: {} }), "P", "t", NOW).bmsSetpoints, null);
+    assert.equal(
+      parseReading(payload({ bms_setpoints_raw: "nonsense" }), "P", "t", NOW).bmsSetpoints,
+      null,
+    );
+  });
+
+  it("drops values that cannot have come off a 16-bit wire", () => {
+    const r = parseReading(
+      payload({
+        bms_setpoints_raw: { over_discharge: 2500, over_current: -1, pack_capacity: 70000, series_count: 1.5 },
+      }),
+      "P",
+      "t",
+      NOW,
+    );
+    assert.deepEqual(r.bmsSetpoints, { over_discharge: 2500 });
+  });
+});

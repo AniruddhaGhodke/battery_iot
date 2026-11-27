@@ -22,6 +22,7 @@ function fakeSql(rows: Row[]) {
     writes.push(`${text} :: ${JSON.stringify(values)}`);
     return Promise.resolve([]);
   };
+  sql.json = (v: unknown) => ({ json: v });
   return { sql: sql as Sql, writes };
 }
 
@@ -117,5 +118,37 @@ describe("pack identity", () => {
     );
     // The UID still sends its readings to its own pack, not to the other row.
     assert.equal(packs.lookupByIdentity("EM_PACK_16S_03", "AABBCCDDEEFF"), 7);
+  });
+});
+
+describe("setpoints the BMS reports", () => {
+  const pack: Row = {
+    id: 7,
+    device_id: "EM_PACK_40S_01",
+    enabled: true,
+    topic_slug: "pack1",
+    device_uid: "AABBCCDDEEFF",
+  };
+
+  it("writes them once, not on every reading", async () => {
+    const { packs, writes } = await registry([pack]);
+    for (let i = 0; i < 5; i++) {
+      packs.noteSetpoints("EM_PACK_40S_01", { over_discharge: 2500, over_current: 1000 });
+    }
+    await settled();
+    assert.equal(writes.filter((w) => w.includes("bms_setpoints")).length, 1);
+
+    // A limit someone changed on the BMS itself is worth recording.
+    packs.noteSetpoints("EM_PACK_40S_01", { over_discharge: 2600, over_current: 1000 });
+    await settled();
+    assert.equal(writes.filter((w) => w.includes("bms_setpoints")).length, 2);
+  });
+
+  it("ignores a pack that reports none", async () => {
+    const { packs, writes } = await registry([pack]);
+    packs.noteSetpoints("EM_PACK_40S_01", null);
+    packs.noteSetpoints("WHO", { over_discharge: 2500 });
+    await settled();
+    assert.equal(writes.filter((w) => w.includes("bms_setpoints")).length, 0);
   });
 });

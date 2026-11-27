@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { StatusChip, when } from "@/components/StatusChip";
+import { REPORTED_FOR_FIELD, type ReportedKey } from "@/lib/bms-setpoints";
 import type { ConfigRequestRow, ConfigurablePack, ControlRequested } from "@/lib/config-data";
 import { CONTROL_ACTIONS, CONTROL_MAX_CURRENT_A } from "@/lib/pack-control";
 import {
@@ -41,12 +42,15 @@ function Field({
   f,
   checked,
   value,
+  reported,
   onToggle,
   onValue,
 }: {
   f: FieldSpec;
   checked: boolean;
   value: string;
+  /** What the BMS says this limit is, as a raw count. */
+  reported: number | undefined;
   onToggle: (on: boolean) => void;
   onValue: (v: string) => void;
 }) {
@@ -77,6 +81,14 @@ function Field({
             </span>
           )}
           <span className="block text-xs text-ink-2">{f.help}</span>
+          {reported !== undefined && (
+            <span className="mt-1 block text-xs text-ink-2">
+              <span className="font-medium text-ink">BMS reports {reported.toLocaleString("en-IN")}</span>{" "}
+              <span className="text-ink-3">
+                raw — units unconfirmed, compare with the BMS display before this is written
+              </span>
+            </span>
+          )}
         </span>
       </label>
 
@@ -300,8 +312,12 @@ export function Settings({ initial }: { initial: Payload }) {
         {pendingCount > 0 && (
           <p className="mt-3 rounded-lg border border-line bg-surface-2 p-3 text-xs text-ink-2">
             <span className="font-medium text-ink">{pendingCount} settings are listed but cannot be sent yet.</span>{" "}
-            The BMS accepts them over CAN, but the gateway firmware does not forward them from MQTT.
-            They are shown so the values and limits are agreed before firmware work starts.
+            The BMS accepts them over CAN, but two things have to be settled first: the gateway has
+            to forward them from MQTT, and the protocol document does not say what units these
+            16-bit values are in — it gives units for 3 of its 28 commands, and it already disagrees
+            with the working firmware about capacity and state of charge. A protection limit written
+            ten times too high is an over-current trip that never trips, so the pack now reports what
+            it is actually running and each scale is fixed against that before any of it is sent.
           </p>
         )}
 
@@ -322,6 +338,9 @@ export function Settings({ initial }: { initial: Payload }) {
                       f={f}
                       checked={!!include[f.key]}
                       value={values[f.key] ?? ""}
+                      reported={
+                        pack?.bmsSetpoints?.[REPORTED_FOR_FIELD[f.key] as ReportedKey] ?? undefined
+                      }
                       onToggle={(on) => {
                         setInclude((p) => ({ ...p, [f.key]: on }));
                         // Nothing to choose when there is only one value.

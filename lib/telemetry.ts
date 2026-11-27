@@ -7,6 +7,8 @@
  * pack voltage.
  */
 
+import { parseReportedSetpoints, type ReportedSetpoints } from "./bms-setpoints.ts";
+
 export type Alarms = {
   over_current: boolean;
   over_discharge: boolean;
@@ -26,6 +28,8 @@ export type Reading = {
   firmwareVersion: string | null;
   /** The board says its clock is NTP-synced. */
   timeSynced: boolean;
+  /** The limits the BMS reports for itself, as raw counts. Null if unsent. */
+  bmsSetpoints: ReportedSetpoints | null;
   topic: string;
   /**
    * Ordering time, epoch ms: deviceTime when the device says its clock is
@@ -227,6 +231,7 @@ export function parseReading(
     firmwareVersion: fw ? fw.slice(0, 32) : null,
     // The firmware sets this explicitly; older builds omit it and fake a clock.
     timeSynced: d.time_synced === true,
+    bmsSetpoints: parseReportedSetpoints(d.bms_setpoints_raw),
     topic,
     ts: orderingTime(receivedAt, deviceTime, timeOk, replay, clockToleranceS),
     receivedAt,
