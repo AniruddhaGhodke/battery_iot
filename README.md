@@ -413,7 +413,14 @@ is decoded as remaining amp-hours, and group 5's "remaining capacity" as
 state of charge. A protection limit written ten times too high is an
 over-current trip that never trips, so none of this is inferred.
 
-What settles it is the BMS itself. It broadcasts its own configuration in
+The BMS's own configuration app answers half of it: it shows voltages to
+0.01 V and current and capacity to 0.1, which is the resolution the wire
+carries — hundredths of a volt, tenths of an amp — not the millivolts these
+fields were first written in. `canScale` on each field does the conversion
+and `canEncode` applies it. One pack was found running a balance-start of
+3.78 V, which the original 3.70 V ceiling would have refused outright.
+
+What settles the rest is the BMS itself. It broadcasts its own configuration in
 sending groups 1, 2, 5 and 6, and the gateway now forwards those numbers
 **unscaled** as `bms_setpoints_raw`. Ingest stores the latest set on
 `packs.bms_setpoints` (written only when it changes, since it is
@@ -423,21 +430,21 @@ fixes that field's scale; see `lib/bms-setpoints.ts`.
 
 | Key | CAN | Range | Group |
 |---|---|---|---|
-| `bms_over_discharge_mv` | `0x01` | 2,000–3,000 mV/cell | protection |
-| `bms_over_charge_mv` | `0x05` | 3,400–3,800 mV/cell | protection |
-| `bms_over_current_a` | `0x02` | 1–1,000 A | protection |
-| `bms_over_temperature_c` | `0x06` | 0–100 °C | protection |
-| `bms_low_temperature_c` | `0x18` | −100–0 °C | protection |
-| `bms_discharge_recovery_mv` | `0x0B` | 2,000–3,300 mV/cell | protection |
-| `bms_charge_recovery_mv` | `0x0A` | 3,200–3,700 mV/cell | protection |
-| `bms_cell_diff_mv` | `0x17` | 0–5,000 mV | protection |
-| `bms_power_off_mv` | `0x0E` | 2,000–3,300 mV/cell | protection |
+| `bms_over_discharge_v` | `0x01` | 2.00–3.00 V/cell (×100) | protection |
+| `bms_over_charge_v` | `0x05` | 3.40–3.80 V/cell (×100) | protection |
+| `bms_over_current_a` | `0x02` | 1–1,000 A, 0.1 steps (×10) | protection |
+| `bms_over_temperature_c` | `0x06` | 0–100 °C, 0.1 steps (×10) | protection |
+| `bms_low_temperature_c` | `0x18` | −100–0 °C, encoding unconfirmed | protection |
+| `bms_discharge_recovery_v` | `0x0B` | 2.00–3.30 V/cell (×100) | protection |
+| `bms_charge_recovery_v` | `0x0A` | 3.20–3.70 V/cell (×100) | protection |
+| `bms_cell_diff_v` | `0x17` | 0–5.00 V (×100) | protection |
+| `bms_power_off_v` | `0x0E` | 1.80–3.30 V/cell (×100) | protection |
 | `bms_power_off_delay_s` | `0x0F` | 0–3,600 s | protection |
 | `bms_auto_balance` | `0x08` | on / off | balancing |
-| `bms_balance_start_mv` | `0x11` | 3,000–3,700 mV/cell | balancing |
+| `bms_balance_start_v` | `0x11` | 3.00–3.90 V/cell (×100) | balancing |
 | `bms_fan_start_c` | `0x1A` | 0–100 °C | thermal |
 | `bms_ptc_start_c` | `0x1B` | 0–100 °C | thermal |
-| `bms_capacity_ah` | `0x03` | 1–10,000 Ah | commissioning |
+| `bms_capacity_ah` | `0x03` | 1–6,000 Ah, 0.1 steps (×10) | commissioning |
 | `bms_series_count` | `0x04` | 1–192 | commissioning |
 | `bms_hall_sensor` | `0x19` | 1, 2 or 3 | commissioning |
 | `bms_power_on_default` | `0x0C` | on / off | commissioning |

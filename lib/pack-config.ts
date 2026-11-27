@@ -31,19 +31,19 @@ export type ConfigKey =
   | "can_baud_kbps"
   | "telemetry_interval_ms"
   // BMS protection setpoints
-  | "bms_over_discharge_mv"
-  | "bms_over_charge_mv"
+  | "bms_over_discharge_v"
+  | "bms_over_charge_v"
   | "bms_over_current_a"
   | "bms_over_temperature_c"
   | "bms_low_temperature_c"
-  | "bms_discharge_recovery_mv"
-  | "bms_charge_recovery_mv"
-  | "bms_cell_diff_mv"
-  | "bms_power_off_mv"
+  | "bms_discharge_recovery_v"
+  | "bms_charge_recovery_v"
+  | "bms_cell_diff_v"
+  | "bms_power_off_v"
   | "bms_power_off_delay_s"
   // balancing
   | "bms_auto_balance"
-  | "bms_balance_start_mv"
+  | "bms_balance_start_v"
   // thermal management
   | "bms_fan_start_c"
   | "bms_ptc_start_c"
@@ -85,6 +85,13 @@ type Common = {
   restarts: boolean;
   /** CAN command id in the 192S protocol, for whoever writes the firmware. */
   canCommand?: string;
+  /**
+   * Display units -> the 16-bit value the BMS wants. The BMS's own app shows
+   * voltages to 0.01 V and current and capacity to 0.1, which is the
+   * resolution the wire carries; see lib/bms-setpoints.ts. Absent means the
+   * value goes as it reads.
+   */
+  canScale?: number;
   /** Firmware does not forward this yet, so it cannot be sent. */
   pending?: boolean;
 };
@@ -144,15 +151,21 @@ export const CONFIG_FIELDS: FieldSpec[] = [
   },
 
   // ---- BMS protection setpoints -------------------------------------------
+  // Units and resolution come from the BMS's own configuration app, which
+  // shows voltages to 0.01 V and current and capacity to 0.1 — so the wire
+  // carries hundredths of a volt and tenths of an amp, not millivolts.
+  // `canScale` converts; see lib/bms-setpoints.ts for why this is not taken
+  // from the protocol document.
   {
-    key: "bms_over_discharge_mv",
+    key: "bms_over_discharge_v",
     kind: "range",
-    min: 2_000,
-    max: 3_000,
-    step: 10,
+    min: 2,
+    max: 3,
+    step: 0.01,
+    canScale: 100,
     label: "Over-discharge cut-off",
-    unit: "mV/cell",
-    help: "Per cell. Below about 2,500 mV an LFP cell is into the knee with almost nothing left.",
+    unit: "V/cell",
+    help: "Per cell. Below about 2.50 V an LFP cell is into the knee with almost nothing left.",
     group: "protection",
     target: "bms",
     canCommand: "0x01",
@@ -160,14 +173,15 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     pending: true,
   },
   {
-    key: "bms_over_charge_mv",
+    key: "bms_over_charge_v",
     kind: "range",
-    min: 3_400,
-    max: 3_800,
-    step: 10,
+    min: 3.4,
+    max: 3.8,
+    step: 0.01,
+    canScale: 100,
     label: "Over-charge cut-off",
-    unit: "mV/cell",
-    help: "Per cell. 3,650 mV is the usual LFP ceiling; above that costs cycle life quickly.",
+    unit: "V/cell",
+    help: "Per cell. 3.65 V is the usual LFP ceiling; above that costs cycle life quickly.",
     group: "protection",
     target: "bms",
     canCommand: "0x05",
@@ -179,7 +193,8 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     kind: "range",
     min: 1,
     max: 1_000,
-    step: 1,
+    step: 0.1,
+    canScale: 10,
     label: "Over-current limit",
     unit: "A",
     help: "Must sit below the contactor, fuse and cable rating, not just the cells'.",
@@ -194,7 +209,8 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     kind: "range",
     min: 0,
     max: 100,
-    step: 1,
+    step: 0.1,
+    canScale: 10,
     label: "Over-temperature limit",
     unit: "°C",
     help: "Raising this silences the over-temperature alert as well as the protection.",
@@ -210,9 +226,12 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     min: -100,
     max: 0,
     step: 1,
+    // Scale and sign unconfirmed: the protocol says -100 to 0, and the BMS's
+    // app displays this one as a positive whole number. Until a pack shows
+    // what it puts on the wire, this stays as it reads.
     label: "Low-temperature limit",
     unit: "°C",
-    help: "Charging LFP below 0 °C plates lithium. The protocol allows −100 to 0.",
+    help: "Charging LFP below 0 °C plates lithium. The protocol allows −100 to 0, but the BMS app displays it unsigned — how it is encoded is still unconfirmed.",
     group: "protection",
     target: "bms",
     canCommand: "0x18",
@@ -220,13 +239,14 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     pending: true,
   },
   {
-    key: "bms_discharge_recovery_mv",
+    key: "bms_discharge_recovery_v",
     kind: "range",
-    min: 2_000,
-    max: 3_300,
-    step: 10,
+    min: 2,
+    max: 3.3,
+    step: 0.01,
+    canScale: 100,
     label: "Discharge recovery",
-    unit: "mV/cell",
+    unit: "V/cell",
     help: "Where discharge protection releases. Set it above the cut-off or the pack will chatter.",
     group: "protection",
     target: "bms",
@@ -235,13 +255,14 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     pending: true,
   },
   {
-    key: "bms_charge_recovery_mv",
+    key: "bms_charge_recovery_v",
     kind: "range",
-    min: 3_200,
-    max: 3_700,
-    step: 10,
+    min: 3.2,
+    max: 3.7,
+    step: 0.01,
+    canScale: 100,
     label: "Charge recovery",
-    unit: "mV/cell",
+    unit: "V/cell",
     help: "Where charge protection releases. Set it below the cut-off.",
     group: "protection",
     target: "bms",
@@ -250,14 +271,15 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     pending: true,
   },
   {
-    key: "bms_cell_diff_mv",
+    key: "bms_cell_diff_v",
     kind: "range",
     min: 0,
-    max: 5_000,
-    step: 10,
+    max: 5,
+    step: 0.01,
+    canScale: 100,
     label: "Cell difference limit",
-    unit: "mV",
-    help: "The BMS's own imbalance protection. The dashboard's imbalance alert is separate and stays at ALERT_SPREAD_MV.",
+    unit: "V",
+    help: "The BMS's own imbalance protection, and it ships effectively disabled at 5.00 V — no real spread will ever reach it. The dashboard's imbalance alert is separate and stays at ALERT_SPREAD_MV.",
     group: "protection",
     target: "bms",
     canCommand: "0x17",
@@ -265,13 +287,14 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     pending: true,
   },
   {
-    key: "bms_power_off_mv",
+    key: "bms_power_off_v",
     kind: "range",
-    min: 2_000,
-    max: 3_300,
-    step: 10,
+    min: 1.8,
+    max: 3.3,
+    step: 0.01,
+    canScale: 100,
     label: "Host power-off voltage",
-    unit: "mV/cell",
+    unit: "V/cell",
     help: "Where the BMS shuts its own electronics down to stop draining the pack.",
     group: "protection",
     target: "bms",
@@ -313,13 +336,16 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     pending: true,
   },
   {
-    key: "bms_balance_start_mv",
+    key: "bms_balance_start_v",
     kind: "range",
-    min: 3_000,
-    max: 3_700,
-    step: 10,
+    // Up to 3.90: a pack was found running 3.78, which the old 3.70 ceiling
+    // would have refused.
+    min: 3,
+    max: 3.9,
+    step: 0.01,
+    canScale: 100,
     label: "Balance start voltage",
-    unit: "mV/cell",
+    unit: "V/cell",
     help: "Balancing only runs above this while charging.",
     group: "balancing",
     target: "bms",
@@ -335,6 +361,8 @@ export const CONFIG_FIELDS: FieldSpec[] = [
     min: 0,
     max: 100,
     step: 1,
+    // Shown as a whole number in the BMS app, unlike the protection
+    // temperature, which shows a decimal.
     label: "Fan start",
     unit: "°C",
     help: "Set it well below the over-temperature limit so cooling has a chance to work.",
@@ -364,9 +392,11 @@ export const CONFIG_FIELDS: FieldSpec[] = [
   {
     key: "bms_capacity_ah",
     kind: "range",
+    // 6,553.5 is where tenths of an amp-hour stop fitting in 16 bits.
     min: 1,
-    max: 10_000,
-    step: 1,
+    max: 6_000,
+    step: 0.1,
+    canScale: 10,
     label: "Pack capacity",
     unit: "Ah",
     help: "Changing this rescales SOC and every stored capacity figure.",
@@ -473,11 +503,31 @@ export function fieldError(f: FieldSpec, v: unknown): string | null {
   if (f.kind === "bool") {
     return v === f.onValue || v === f.offValue ? null : `${f.label}: must be on or off`;
   }
-  if (!Number.isInteger(v)) return `${f.label}: must be a whole number of ${f.unit}`;
   if (v < f.min || v > f.max) {
     return `${f.label}: must be ${f.min.toLocaleString("en-IN")}–${f.max.toLocaleString("en-IN")} ${f.unit}`;
   }
+  // Resolution is whatever the wire can carry: a whole count after scaling.
+  const scale = f.canScale ?? 1;
+  const wire = v * scale;
+  if (Math.abs(wire - Math.round(wire)) > 1e-6) {
+    const finest = scale === 1 ? 1 : 1 / scale;
+    return `${f.label}: the finest step is ${finest} ${f.unit}`.trimEnd();
+  }
+  if (f.target === "bms" && (Math.round(wire) < 0 || Math.round(wire) > 65_535)) {
+    return `${f.label}: does not fit the 16-bit value the BMS takes`;
+  }
   return null;
+}
+
+/**
+ * The 16-bit number that goes on the wire for a value in display units.
+ *
+ * Rounded, because 2.3 * 100 is 229.99999999999997 in binary floating point
+ * and a protection limit one count low for that reason would be a silly way
+ * to lose. Callers validate with fieldError first; this does not re-check.
+ */
+export function canEncode(f: FieldSpec, v: number): number {
+  return Math.round(v * (f.canScale ?? 1));
 }
 
 /**

@@ -10,6 +10,7 @@ import {
 } from "../ingest/commands.ts";
 import { CONTROL_ACTIONS, interlockError, validateControl } from "../lib/pack-control.ts";
 import {
+  canEncode,
   CONFIG_FIELDS,
   fieldError,
   FIELD_BY_KEY,
@@ -321,13 +322,13 @@ describe("timeouts", () => {
 
 describe("pending fields", () => {
   it("refuses a setting the firmware does not forward yet, even if it is in range", () => {
-    const v = validateSettings({ bms_over_discharge_mv: 2500 });
+    const v = validateSettings({ bms_over_discharge_v: 2500 });
     assert.equal(v.ok, false);
     assert.match(v.ok === false ? v.errors[0] : "", /does not forward this yet/);
   });
 
   it("refuses the whole request if any field is pending", () => {
-    const v = validateSettings({ telemetry_interval_ms: 5000, bms_over_charge_mv: 3650 });
+    const v = validateSettings({ telemetry_interval_ms: 5000, bms_over_charge_v: 3650 });
     assert.equal(v.ok, false);
   });
 
@@ -717,5 +718,62 @@ describe("renaming a pack", () => {
     for (const bad of ["", "   ", "a b", "pack#1", "x".repeat(32), 42]) {
       assert.equal(validateSettings({ device_id: bad }).ok, false, JSON.stringify(bad));
     }
+  });
+});
+
+describe("BMS setpoint units", () => {
+  it("encodes in the resolution the wire carries, not millivolts", () => {
+    const v = FIELD_BY_KEY.bms_over_discharge_v;
+    // 2.3 * 100 is 229.99999999999997 in floating point. One count low on a
+    // protection limit is a silly way to lose.
+    assert.equal(canEncode(v, 2.3), 230);
+    assert.equal(canEncode(FIELD_BY_KEY.bms_over_charge_v, 3.45), 345);
+    assert.equal(canEncode(FIELD_BY_KEY.bms_over_current_a, 125), 1250);
+    assert.equal(canEncode(FIELD_BY_KEY.bms_capacity_ah, 45), 450);
+    assert.equal(canEncode(FIELD_BY_KEY.bms_series_count, 57), 57);
+  });
+
+  it("accepts the settings a real pack was found running", () => {
+    // Read off a 57S pack's own configuration app.
+    for (const [key, value] of [
+      ["bms_over_discharge_v", 2.3],
+      ["bms_over_charge_v", 3.45],
+      ["bms_over_current_a", 125],
+      ["bms_capacity_ah", 45],
+      ["bms_charge_recovery_v", 3.3],
+      ["bms_discharge_recovery_v", 2.55],
+      ["bms_power_off_v", 2],
+      ["bms_power_off_delay_s", 600],
+      ["bms_cell_diff_v", 5],
+      ["bms_precharge_delay_s", 2],
+      ["bms_series_count", 57],
+      ["bms_over_temperature_c", 60],
+      ["bms_fan_start_c", 40],
+      ["bms_ptc_start_c", 0],
+      ["bms_hall_sensor", 2],
+      // The one the original 3.70 V ceiling would have refused.
+      ["bms_balance_start_v", 3.78],
+    ] as const) {
+      assert.equal(fieldError(FIELD_BY_KEY[key], value), null, `${key} = ${value}`);
+    }
+  });
+
+  it("refuses a value finer than the wire can carry", () => {
+    assert.match(fieldError(FIELD_BY_KEY.bms_over_discharge_v, 2.305) ?? "", /finest step/);
+    assert.match(fieldError(FIELD_BY_KEY.bms_over_current_a, 125.55) ?? "", /finest step/);
+    assert.equal(fieldError(FIELD_BY_KEY.bms_over_current_a, 125.5), null);
+  });
+
+  it("still refuses anything outside the field's range", () => {
+    assert.notEqual(fieldError(FIELD_BY_KEY.bms_over_discharge_v, 2_500), null);
+    assert.notEqual(fieldError(FIELD_BY_KEY.bms_over_charge_v, 4), null);
+    assert.notEqual(fieldError(FIELD_BY_KEY.bms_capacity_ah, 9_000), null);
+  });
+
+  it("keeps every BMS field pending until a pack confirms the scale", () => {
+    const bms = CONFIG_FIELDS.filter((f) => f.target === "bms");
+    assert.equal(bms.length, 19);
+    assert.equal(bms.every((f) => f.pending), true);
+    assert.equal(validateSettings({ bms_over_discharge_v: 2.3 }).ok, false);
   });
 });

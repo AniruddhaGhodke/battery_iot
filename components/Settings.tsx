@@ -83,10 +83,19 @@ function Field({
           <span className="block text-xs text-ink-2">{f.help}</span>
           {reported !== undefined && (
             <span className="mt-1 block text-xs text-ink-2">
-              <span className="font-medium text-ink">BMS reports {reported.toLocaleString("en-IN")}</span>{" "}
-              <span className="text-ink-3">
-                raw — units unconfirmed, compare with the BMS display before this is written
-              </span>
+              <span className="font-medium text-ink">BMS reports {reported.toLocaleString("en-IN")} raw</span>
+              {f.canScale ? (
+                <>
+                  {" = "}
+                  <span className="font-medium text-ink">
+                    {(reported / f.canScale).toFixed(String(1 / f.canScale).split(".")[1]?.length ?? 0)}{" "}
+                    {f.unit}
+                  </span>{" "}
+                  <span className="text-ink-3">if the scale is right — check it against the BMS app</span>
+                </>
+              ) : (
+                <span className="text-ink-3"> — scale unconfirmed, check it against the BMS app</span>
+              )}
             </span>
           )}
         </span>

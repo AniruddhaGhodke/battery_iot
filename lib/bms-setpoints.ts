@@ -43,15 +43,15 @@ export type ReportedSetpoints = Partial<Record<ReportedKey, number>>;
 
 /** Which dashboard field each reported value belongs to. */
 export const REPORTED_FOR_FIELD: Record<string, ReportedKey> = {
-  bms_over_discharge_mv: "over_discharge",
+  bms_over_discharge_v: "over_discharge",
   bms_over_current_a: "over_current",
   bms_capacity_ah: "pack_capacity",
   bms_series_count: "series_count",
-  bms_over_charge_mv: "over_charge",
+  bms_over_charge_v: "over_charge",
   bms_over_temperature_c: "over_temperature",
-  bms_charge_recovery_mv: "charge_recovery",
-  bms_discharge_recovery_mv: "discharge_recovery",
-  bms_balance_start_mv: "balance_start",
+  bms_charge_recovery_v: "charge_recovery",
+  bms_discharge_recovery_v: "discharge_recovery",
+  bms_balance_start_v: "balance_start",
 };
 
 /**
